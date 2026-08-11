@@ -1,0 +1,504 @@
+const hubspot = require('@hubspot/api-client');
+
+const CQ_TYPE = '2-66707814';
+const CAMPAIGN_TYPE = '2-66707816';
+const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;
+const FALLBACK_LOGO_URL =
+  'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png';
+
+const EXCLUDED_BUYERS = new Set([
+  'Boots',
+  'AMC Theatres',
+  'Anadolu Efes',
+  'Aperam',
+  'Apple',
+  'Asda',
+  'Ashirvad Pipes Private Limited',
+  'AutoNation',
+  'Berger Paints',
+  'Caleres',
+  'Chevron',
+  'China Resources Vanguard',
+  'Citi',
+  'CN',
+  'Coromandel International Limited',
+  'Country Liquor',
+  'Tarmac',
+  'Deutsche Bank',
+  'Doosan',
+  'Dover Corporation',
+  'Dover Fluids',
+  "Dr. Reddy's",
+  "Dr. Reddy's Vikreta",
+  'Eaton',
+  'Engineering Ingegneria Informatica S.p.A.',
+  'Evergrande',
+  'ExxonMobil NAPES',
+  'Fincantieri',
+  'Ford Europe',
+  'Ford Motor Company',
+  'Garrett Motion',
+  'GAVL',
+  'Adeo',
+  'Grupo Posadas',
+  'H.B. Fuller',
+  'Haier',
+  'Havells India Limited',
+  'Inorbit',
+  'Intel',
+  'ITC Group',
+  'ITC TM&D',
+  'ITV',
+  'JMC',
+  'JOYOUNG',
+  'Jubilant FoodWorks Limited',
+  'Jubilant Ingrevia',
+  'Jumbo',
+  'Lenskart Solutions',
+  'Leroy Merlin IT',
+  'Logitech',
+  'Lyreco',
+  'Marathon Petroleum',
+  'Marks and Spencer',
+  'Mastercard',
+  'McKesson',
+  'Hindustan Media Ventures Limited',
+  'Medtronic',
+  'Metso',
+  'Mondelez',
+  'MOOG',
+  'Morrisons',
+  'Mothercare',
+  'Singtel',
+  'NewYork-Presbyterian',
+  'Nokia',
+  'Nomad Foods',
+  'NXP',
+  'Virgin Media O2',
+  'Oriflame',
+  'Panasonic',
+  'VIACOM SAP',
+  'Payless ShoeSource',
+  'Perfetti Van Melle',
+  'Philips Domestic Appliances',
+  'Philips',
+  'Pidilite Industries Limited',
+  'Quad',
+  'Radico Khaitan',
+  'Relaxo Footwears Limited',
+  'Reliance PBG',
+  'RH',
+  'Rivian',
+  'Sudarshan',
+  'ToysRUs',
+  'TreeHouse Foods',
+  'Tvs Srichakra',
+  'Uber',
+  'Unilever China',
+  'UNFI',
+  'VECV Funder',
+  'Wabtec',
+  'Arcelik',
+  'Arçelik'
+].map((value) => value.trim().toLowerCase()));
+
+const text = (value) => (value == null ? '' : String(value));
+const number = (value) =>
+  Number.isFinite(Number(value)) ? Number(value) : Number.NEGATIVE_INFINITY;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const retryable = (error) => {
+  const status = Number(
+    error?.response?.statusCode ?? error?.statusCode ?? error?.status
+  );
+
+  return (
+    status === 429 ||
+    status >= 500 ||
+    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code)
+  );
+};
+
+async function withRetry(operation, label) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!retryable(error) || attempt >= 2) {
+        throw error;
+      }
+
+      const wait = 250 * (attempt + 1);
+      console.log(`${label} transient failure; retrying in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+}
+
+function parsePayload(record) {
+  const raw = text(record.properties?.payload_json);
+
+  if (!raw.trim()) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Campaign Qualification ${record.id} payload_json is not valid JSON`
+    );
+  }
+}
+
+function timestamp(value) {
+  const raw = text(value).trim();
+
+  if (!raw) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+  return Number.isNaN(date.getTime())
+    ? Number.NEGATIVE_INFINITY
+    : date.getTime();
+}
+
+function formatDate(value) {
+  const raw = text(value).trim();
+
+  if (!raw) {
+    return '';
+  }
+
+  const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+
+  return Number.isNaN(date.getTime())
+    ? raw
+    : date.toLocaleDateString('en-US', {
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric'
+      });
+}
+
+function customerCount(payload) {
+  const value =
+    payload?.number_of_customers ?? payload?.['number of customers'];
+
+  if (value == null || text(value).trim() === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function buyerFlag(payload) {
+  const count = customerCount(payload);
+
+  if (count == null) {
+    return null;
+  }
+
+  return count === 1 ? 'single_buyer' : 'multi_buyer';
+}
+
+function emptyOutput(rawCount) {
+  return {
+    matching_cq_count: '0',
+    raw_matching_cq_count: String(rawCount),
+    cq_match_status: 'no_match',
+    buyer_count_flag: '',
+    selected_offers_json: '[]',
+    selected_primary_cq_id: '',
+    selected_primary_payload_json: '',
+    draft_offers_table: '',
+    campaign_user_status: 'null',
+    buyer_logo_url: FALLBACK_LOGO_URL,
+    auth_service_uuid: '',
+    currency: '',
+    discount_amount: '',
+    discounted_amount: '',
+    draft_offer_uuid: '',
+    eligible_invoice_amount: '',
+    good_funds_date_picker: '',
+    non_reg_buyer_exclusion_flag: 'no',
+    leading_maker_organization_uuid: '',
+    number_of_customers: '',
+    number_of_invoices: '',
+    primary_buyer_division_uuid: '',
+    primary_buyer_name: '',
+    primary_buyer_permalink: '',
+    rate: '',
+    rate_type: ''
+  };
+}
+
+async function campaignDetails(client, cqId) {
+  const associations = await withRetry(
+    () =>
+      client.crm.associations.v4.basicApi.getPage(
+        CQ_TYPE,
+        cqId,
+        CAMPAIGN_TYPE,
+        undefined,
+        100
+      ),
+    `CQ ${cqId} association lookup`
+  );
+
+  const ids = (associations.results || [])
+    .filter(
+      (item) =>
+        !item.associationTypeId ||
+        String(item.associationTypeId) === String(CAMPAIGN_ASSOCIATION_TYPE_ID)
+    )
+    .map((item) => text(item.toObjectId))
+    .filter(Boolean);
+
+  if (!ids.length) {
+    return {
+      priority: Number.NEGATIVE_INFINITY,
+      userStatus: 'null',
+      campaignIds: []
+    };
+  }
+
+  const response = await withRetry(
+    () =>
+      client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, {
+        filterGroups: [
+          {
+            filters: [
+              {
+                propertyName: 'hs_object_id',
+                operator: 'IN',
+                values: ids
+              }
+            ]
+          }
+        ],
+        properties: ['campaign_priority', 'campaign_config'],
+        limit: 100
+      }),
+    `Campaign lookup for CQ ${cqId}`
+  );
+
+  const campaign = (response.results || []).sort(
+    (a, b) =>
+      number(b.properties?.campaign_priority) -
+      number(a.properties?.campaign_priority)
+  )[0];
+
+  if (!campaign) {
+    return {
+      priority: Number.NEGATIVE_INFINITY,
+      userStatus: 'null',
+      campaignIds: ids
+    };
+  }
+
+  let config = {};
+
+  try {
+    config = campaign.properties?.campaign_config
+      ? JSON.parse(campaign.properties.campaign_config)
+      : {};
+  } catch {
+    throw new Error(
+      `AO Campaign ${campaign.id} campaign_config is not valid JSON`
+    );
+  }
+
+  return {
+    campaignId: text(campaign.id),
+    campaignIds: ids,
+    priority: number(campaign.properties?.campaign_priority),
+    userStatus:
+      config.userStatus == null ? 'null' : text(config.userStatus)
+  };
+}
+
+function winner(first, second) {
+  const priority = number(second.priority) - number(first.priority);
+
+  if (priority) {
+    return priority < 0 ? first : second;
+  }
+
+  const started = timestamp(second.started) - timestamp(first.started);
+  return started < 0 ? first : second;
+}
+
+exports.main = async (event, callback) => {
+  const client = new hubspot.Client({
+    accessToken: process.env.PRIVATE_APP_ACCESS_TOKEN
+  });
+
+  const auth = text(event.inputFields.contact_auth_uuid);
+
+  if (!auth) {
+    return callback({
+      outputFields: emptyOutput(0)
+    });
+  }
+
+  const response = await withRetry(
+    () =>
+      client.crm.objects.searchApi.doSearch(CQ_TYPE, {
+        filterGroups: [
+          {
+            filters: [
+              {
+                propertyName: 'recipient_auth_service_uuid',
+                operator: 'EQ',
+                value: auth
+              },
+              {
+                propertyName: 'payload_kind',
+                operator: 'EQ',
+                value: 'ACTIONABLE_OFFER'
+              },
+              {
+                propertyName: 'expires_at',
+                operator: 'GT',
+                value: String(Date.now())
+              }
+            ]
+          }
+        ],
+        properties: ['payload_json', 'source_run_started_at', 'expires_at'],
+        limit: 100
+      }),
+    'Campaign Qualification search'
+  );
+
+  const records = response.results || [];
+  const eligible = records.filter((record) => {
+    const payload = parsePayload(record);
+
+    return (
+      payload &&
+      !EXCLUDED_BUYERS.has(
+        text(payload.primary_buyer_name).trim().toLowerCase()
+      )
+    );
+  });
+
+  if (!eligible.length) {
+    return callback({
+      outputFields: emptyOutput(records.length)
+    });
+  }
+
+  const candidates = await Promise.all(
+    eligible.map(async (record) => ({
+      ...(await campaignDetails(client, record.id)),
+      id: text(record.id),
+      raw: text(record.properties?.payload_json),
+      payload: parsePayload(record),
+      started: text(record.properties?.source_run_started_at)
+    }))
+  );
+
+  const selected = candidates.reduce(
+    (current, item) => (current ? winner(current, item) : item),
+    null
+  );
+
+  const payload = selected?.payload;
+  const buyerName = text(payload?.primary_buyer_name).trim();
+  const buyerPermalink = text(payload?.primary_buyer_permalink).trim();
+  const buyerDivisionUuid = text(
+    payload?.primary_buyer_division_uuid
+  ).trim();
+  const flag = buyerFlag(payload);
+
+  if (
+    !selected?.raw ||
+    !buyerName ||
+    !buyerPermalink ||
+    !buyerDivisionUuid ||
+    !flag
+  ) {
+    console.log(
+      'Winning Campaign Qualification is missing buyer identity, buyer division UUID, or a valid number of customers'
+    );
+
+    return callback({
+      outputFields: emptyOutput(records.length)
+    });
+  }
+
+  let logo = FALLBACK_LOGO_URL;
+
+  try {
+    const logoResponse = await withRetry(
+      () =>
+        client.apiRequest({
+          method: 'GET',
+          path: '/cms/v3/hubdb/tables/buyer_logos/rows',
+          qs: {
+            buyer_key__eq: buyerPermalink.toLowerCase() || buyerName.toLowerCase(),
+            limit: 1
+          }
+        }),
+      'Buyer logo lookup'
+    );
+
+    const value = (await logoResponse.json()).results?.[0]?.values?.logo_url;
+    logo =
+      typeof value === 'string' && value
+        ? value
+        : value?.url || FALLBACK_LOGO_URL;
+  } catch (error) {
+    console.log(`Buyer logo lookup failed: ${error.message || error}`);
+  }
+
+  callback({
+    outputFields: {
+      matching_cq_count: '1',
+      raw_matching_cq_count: String(records.length),
+      cq_match_status: 'one_match',
+      buyer_count_flag: flag,
+      selected_offers_json: JSON.stringify([
+        {
+          cq_id: selected.id,
+          payload_json: selected.raw,
+          campaign_priority: selected.priority,
+          source_run_started_at: selected.started
+        }
+      ]),
+      selected_primary_cq_id: selected.id,
+      selected_primary_payload_json: selected.raw,
+      draft_offers_table: '',
+      campaign_user_status: selected.userStatus || 'null',
+      buyer_logo_url: logo,
+      auth_service_uuid: text(payload.auth_service_uuid),
+      currency: text(payload.currency),
+      discount_amount: text(payload.discount_amount),
+      discounted_amount: text(payload.discounted_amount),
+      draft_offer_uuid: text(payload.draft_offer_uuid),
+      eligible_invoice_amount: text(payload.eligible_invoice_amount),
+      good_funds_date_picker: formatDate(
+        payload.good_funds_date_picker || payload.good_funds_date
+      ),
+      non_reg_buyer_exclusion_flag: 'no',
+      leading_maker_organization_uuid: text(
+        payload.leading_maker_organization_uuid
+      ),
+      number_of_customers: text(
+        payload.number_of_customers ?? payload['number of customers']
+      ),
+      number_of_invoices: text(payload.number_of_invoices),
+      primary_buyer_division_uuid: buyerDivisionUuid,
+      primary_buyer_name: buyerName,
+      primary_buyer_permalink: buyerPermalink,
+      rate: Number.isFinite(Number(payload.rate))
+        ? Number(payload.rate).toFixed(1)
+        : text(payload.rate),
+      rate_type: text(payload.rate_type)
+    }
+  });
+};
