@@ -339,12 +339,13 @@ async function campaignDetails(client, cqId) {
 }
 
 function winner(first, second) {
-  const priorityCampaign =
+  const retailCampaign =
     Number(Boolean(second.isPriorityCampaign)) -
     Number(Boolean(first.isPriorityCampaign));
 
-  if (priorityCampaign) {
-    return priorityCampaign > 0 ? second : first;
+  if (retailCampaign) {
+    // When both retail and non-retail CQs are eligible, retail loses.
+    return retailCampaign > 0 ? first : second;
   }
 
   const priority = number(second.priority) - number(first.priority);
@@ -440,13 +441,18 @@ exports.main = async (event, callback) => {
     payload?.primary_buyer_division_uuid
   ).trim();
   const flag = buyerFlag(payload);
-  const cqMatchStatus = selected?.isPriorityCampaign
-    ? PRIORITY_CAMPAIGN_NAME
-    : 'one_match';
+  const retailOnly =
+    candidates.length > 0 &&
+    candidates.every((candidate) => candidate.isPriorityCampaign);
+  const cqMatchStatus = retailOnly ? PRIORITY_CAMPAIGN_NAME : 'one_match';
 
-  if (selected?.isPriorityCampaign) {
+  if (retailOnly) {
     console.log(
-      `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: selected non-expired Campaign Qualification ${selected.id} because it is associated with AO Campaign "${PRIORITY_CAMPAIGN_NAME}".`
+      `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: all ${candidates.length} eligible, non-expired Campaign Qualifications are associated with AO Campaign "${PRIORITY_CAMPAIGN_NAME}".`
+    );
+  } else if (candidates.some((candidate) => candidate.isPriorityCampaign)) {
+    console.log(
+      `cq_match_status=${cqMatchStatus}: ENT Retail Campaign Qualifications were treated as losers because at least one eligible, non-expired non-retail Campaign Qualification was present; selected Campaign Qualification ${selected?.id || 'none'}.`
     );
   } else {
     console.log(
