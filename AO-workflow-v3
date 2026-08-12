@@ -3,6 +3,8 @@ const hubspot = require('@hubspot/api-client');
 const CQ_TYPE = '2-66707814';
 const CAMPAIGN_TYPE = '2-66707816';
 const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;
+const PRIORITY_CAMPAIGN_NAME = 'ENT Retail AO campaign';
+const NORMALIZED_PRIORITY_CAMPAIGN_NAME = PRIORITY_CAMPAIGN_NAME.trim().toLowerCase();
 const FALLBACK_LOGO_URL =
   'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png';
 
@@ -261,7 +263,9 @@ async function campaignDetails(client, cqId) {
     return {
       priority: Number.NEGATIVE_INFINITY,
       userStatus: 'null',
-      campaignIds: []
+      campaignIds: [],
+      campaignName: '',
+      isPriorityCampaign: false
     };
   }
 
@@ -279,23 +283,35 @@ async function campaignDetails(client, cqId) {
             ]
           }
         ],
-        properties: ['campaign_priority', 'campaign_config'],
+        properties: ['campaign_name', 'campaign_priority', 'campaign_config'],
         limit: 100
       }),
     `Campaign lookup for CQ ${cqId}`
   );
 
-  const campaign = (response.results || []).sort(
-    (a, b) =>
-      number(b.properties?.campaign_priority) -
-      number(a.properties?.campaign_priority)
-  )[0];
+  const campaigns = response.results || [];
+  const priorityCampaign = campaigns.find(
+    (campaign) =>
+      text(campaign.properties?.campaign_name).trim().toLowerCase() ===
+      NORMALIZED_PRIORITY_CAMPAIGN_NAME
+  );
+  const campaign =
+    priorityCampaign ||
+    campaigns
+      .slice()
+      .sort(
+        (a, b) =>
+          number(b.properties?.campaign_priority) -
+          number(a.properties?.campaign_priority)
+      )[0];
 
   if (!campaign) {
     return {
       priority: Number.NEGATIVE_INFINITY,
       userStatus: 'null',
-      campaignIds: ids
+      campaignIds: ids,
+      campaignName: '',
+      isPriorityCampaign: false
     };
   }
 
@@ -314,6 +330,8 @@ async function campaignDetails(client, cqId) {
   return {
     campaignId: text(campaign.id),
     campaignIds: ids,
+    campaignName: text(campaign.properties?.campaign_name).trim(),
+    isPriorityCampaign: Boolean(priorityCampaign),
     priority: number(campaign.properties?.campaign_priority),
     userStatus:
       config.userStatus == null ? 'null' : text(config.userStatus)
@@ -321,6 +339,14 @@ async function campaignDetails(client, cqId) {
 }
 
 function winner(first, second) {
+  const priorityCampaign =
+    Number(Boolean(second.isPriorityCampaign)) -
+    Number(Boolean(first.isPriorityCampaign));
+
+  if (priorityCampaign) {
+    return priorityCampaign > 0 ? second : first;
+  }
+
   const priority = number(second.priority) - number(first.priority);
 
   if (priority) {
@@ -414,6 +440,19 @@ exports.main = async (event, callback) => {
     payload?.primary_buyer_division_uuid
   ).trim();
   const flag = buyerFlag(payload);
+  const cqMatchStatus = selected?.isPriorityCampaign
+    ? PRIORITY_CAMPAIGN_NAME
+    : 'one_match';
+
+  if (selected?.isPriorityCampaign) {
+    console.log(
+      `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: selected non-expired Campaign Qualification ${selected.id} because it is associated with AO Campaign "${PRIORITY_CAMPAIGN_NAME}".`
+    );
+  } else {
+    console.log(
+      `cq_match_status=${cqMatchStatus}: selected Campaign Qualification ${selected?.id || 'none'} using the existing campaign-priority and source-run tie-break logic after expiration and excluded-buyer filters.`
+    );
+  }
 
   if (
     !selected?.raw ||
@@ -440,7 +479,8 @@ exports.main = async (event, callback) => {
           method: 'GET',
           path: '/cms/v3/hubdb/tables/buyer_logos/rows',
           qs: {
-            buyer_key__eq: buyerPermalink.toLowerCase() || buyerName.toLowerCase(),
+            buyer_key__eq:
+              buyerPermalink.toLowerCase() || buyerName.toLowerCase(),
             limit: 1
           }
         }),
@@ -460,12 +500,13 @@ exports.main = async (event, callback) => {
     outputFields: {
       matching_cq_count: '1',
       raw_matching_cq_count: String(records.length),
-      cq_match_status: 'one_match',
+      cq_match_status: cqMatchStatus,
       buyer_count_flag: flag,
       selected_offers_json: JSON.stringify([
         {
           cq_id: selected.id,
           payload_json: selected.raw,
+          campaign_name: selected.campaignName,
           campaign_priority: selected.priority,
           source_run_started_at: selected.started
         }
