@@ -8,6 +8,34 @@ const NORMALIZED_PRIORITY_CAMPAIGN_NAME = PRIORITY_CAMPAIGN_NAME.trim().toLowerC
 const FALLBACK_LOGO_URL =
   'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png';
 
+const text = (value) => (value == null ? '' : String(value));
+const number = (value) =>
+  Number.isFinite(Number(value)) ? Number(value) : Number.NEGATIVE_INFINITY;
+const normalizeBuyer = (value) =>
+  text(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[’‘]/g, "'");
+
+const RETAIL_ELIGIBLE_BUYERS = new Set([
+  'Amazon',
+  'Walmart',
+  'TJX',
+  'TJX Europe',
+  'TJX Canada',
+  'Costco',
+  'Costco UK',
+  "Macy's",
+  'Albertsons Companies',
+  'Kroger',
+  'Nordstrom',
+  'Urban Outfitters',
+  'ULTA',
+  "Dick's Sporting Goods",
+  'REI',
+  'Sephora'
+].map(normalizeBuyer));
+
 const EXCLUDED_BUYERS = new Set([
   'Boots',
   'AMC Theatres',
@@ -102,11 +130,8 @@ const EXCLUDED_BUYERS = new Set([
   'Wabtec',
   'Arcelik',
   'Arçelik'
-].map((value) => value.trim().toLowerCase()));
+].map(normalizeBuyer));
 
-const text = (value) => (value == null ? '' : String(value));
-const number = (value) =>
-  Number.isFinite(Number(value)) ? Number(value) : Number.NEGATIVE_INFINITY;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const retryable = (error) => {
@@ -210,7 +235,7 @@ function emptyOutput(rawCount) {
   return {
     matching_cq_count: '0',
     raw_matching_cq_count: String(rawCount),
-    cq_match_status: 'no_match',
+    cq_match_status: 'none',
     buyer_count_flag: '',
     selected_offers_json: '[]',
     selected_primary_cq_id: '',
@@ -339,15 +364,6 @@ async function campaignDetails(client, cqId) {
 }
 
 function winner(first, second) {
-  const retailCampaign =
-    Number(Boolean(second.isPriorityCampaign)) -
-    Number(Boolean(first.isPriorityCampaign));
-
-  if (retailCampaign) {
-    // When both retail and non-retail CQs are eligible, retail loses.
-    return retailCampaign > 0 ? first : second;
-  }
-
   const priority = number(second.priority) - number(first.priority);
 
   if (priority) {
@@ -407,9 +423,7 @@ exports.main = async (event, callback) => {
 
     return (
       payload &&
-      !EXCLUDED_BUYERS.has(
-        text(payload.primary_buyer_name).trim().toLowerCase()
-      )
+      !EXCLUDED_BUYERS.has(normalizeBuyer(payload.primary_buyer_name))
     );
   });
 
@@ -420,52 +434,76 @@ exports.main = async (event, callback) => {
   }
 
   const candidates = await Promise.all(
-    eligible.map(async (record) => ({
-      ...(await campaignDetails(client, record.id)),
-      id: text(record.id),
-      raw: text(record.properties?.payload_json),
-      payload: parsePayload(record),
-      started: text(record.properties?.source_run_started_at)
-    }))
+    eligible.map(async (record) => {
+      const payload = parsePayload(record);
+      const buyerName = text(payload?.primary_buyer_name).trim();
+      const details = await campaignDetails(client, record.id);
+
+      return {
+        ...details,
+        id: text(record.id),
+        raw: text(record.properties?.payload_json),
+        payload,
+        buyerName,
+        isRetailEligibleBuyer: RETAIL_ELIGIBLE_BUYERS.has(
+          normalizeBuyer(buyerName)
+        ),
+        started: text(record.properties?.source_run_started_at)
+      };
+    })
   );
 
-  const selected = candidates.reduce(
+  const nonRetailCandidates = candidates.filter(
+    (candidate) => !candidate.isPriorityCampaign
+  );
+  const eligibleRetailCandidates = candidates.filter(
+    (candidate) =>
+      candidate.isPriorityCampaign && candidate.isRetailEligibleBuyer
+  );
+  const selectionPool =
+    eligibleRetailCandidates.length > 0
+      ? eligibleRetailCandidates
+      : nonRetailCandidates;
+  const selected = selectionPool.reduce(
     (current, item) => (current ? winner(current, item) : item),
     null
   );
 
-  const payload = selected?.payload;
-  const buyerName = text(payload?.primary_buyer_name).trim();
-  const buyerPermalink = text(payload?.primary_buyer_permalink).trim();
-  const buyerDivisionUuid = text(
-    payload?.primary_buyer_division_uuid
-  ).trim();
-  const flag = buyerFlag(payload);
-  const retailOnly =
-    candidates.length > 0 &&
-    candidates.every((candidate) => candidate.isPriorityCampaign);
-  const cqMatchStatus = retailOnly ? PRIORITY_CAMPAIGN_NAME : 'one_match';
+  let cqMatchStatus = 'none';
 
-  if (retailOnly) {
+  if (eligibleRetailCandidates.length > 0) {
+    cqMatchStatus = PRIORITY_CAMPAIGN_NAME;
+  } else if (nonRetailCandidates.length === 1) {
+    cqMatchStatus = 'one_match';
+  } else if (nonRetailCandidates.length > 1) {
+    cqMatchStatus = 'multiple_matches';
+  }
+
+  if (cqMatchStatus === PRIORITY_CAMPAIGN_NAME) {
     console.log(
-      `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: all ${candidates.length} eligible, non-expired Campaign Qualifications are associated with AO Campaign "${PRIORITY_CAMPAIGN_NAME}".`
+      `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: selected an eligible ENT Retail CQ for an approved buyer, taking precedence over ${nonRetailCandidates.length} qualifying non-retail CQ(s).`
     );
-  } else if (candidates.some((candidate) => candidate.isPriorityCampaign)) {
+  } else if (nonRetailCandidates.length > 0) {
+    const excludedRetailCount = candidates.filter(
+      (candidate) =>
+        candidate.isPriorityCampaign && !candidate.isRetailEligibleBuyer
+    ).length;
+
     console.log(
-      `cq_match_status=${cqMatchStatus}: ENT Retail Campaign Qualifications were treated as losers because at least one eligible, non-expired non-retail Campaign Qualification was present; selected Campaign Qualification ${selected?.id || 'none'}.`
+      `cq_match_status=${cqMatchStatus}: selected from ${nonRetailCandidates.length} qualifying non-retail CQ(s). Ignored ${excludedRetailCount} ineligible retail CQ(s).`
     );
   } else {
     console.log(
-      `cq_match_status=${cqMatchStatus}: selected Campaign Qualification ${selected?.id || 'none'} using the existing campaign-priority and source-run tie-break logic after expiration and excluded-buyer filters.`
+      'cq_match_status=none: no qualifying non-retail CQ was found and no ENT Retail CQ matched the eligible buyer list.'
     );
   }
 
   if (
     !selected?.raw ||
-    !buyerName ||
-    !buyerPermalink ||
-    !buyerDivisionUuid ||
-    !flag
+    !text(selected.payload?.primary_buyer_name).trim() ||
+    !text(selected.payload?.primary_buyer_permalink).trim() ||
+    !text(selected.payload?.primary_buyer_division_uuid).trim() ||
+    !buyerFlag(selected.payload)
   ) {
     console.log(
       'Winning Campaign Qualification is missing buyer identity, buyer division UUID, or a valid number of customers'
@@ -475,6 +513,12 @@ exports.main = async (event, callback) => {
       outputFields: emptyOutput(records.length)
     });
   }
+
+  const payload = selected.payload;
+  const buyerName = text(payload.primary_buyer_name).trim();
+  const buyerPermalink = text(payload.primary_buyer_permalink).trim();
+  const buyerDivisionUuid = text(payload.primary_buyer_division_uuid).trim();
+  const flag = buyerFlag(payload);
 
   let logo = FALLBACK_LOGO_URL;
 
@@ -504,7 +548,11 @@ exports.main = async (event, callback) => {
 
   callback({
     outputFields: {
-      matching_cq_count: '1',
+      matching_cq_count: String(
+        eligibleRetailCandidates.length > 0
+          ? eligibleRetailCandidates.length
+          : nonRetailCandidates.length
+      ),
       raw_matching_cq_count: String(records.length),
       cq_match_status: cqMatchStatus,
       buyer_count_flag: flag,
