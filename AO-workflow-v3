@@ -1,22 +1,74 @@
+// ============================================================================
+// WHAT THIS CODE DOES (big picture)
+// ----------------------------------------------------------------------------
+// This is a "custom code" step inside a HubSpot workflow. It runs whenever a
+// contact reaches this step, and its job is to:
+//
+//   1. Look up all "Campaign Qualification" (CQ) records tied to that contact
+//      that represent a live, unexpired special offer.
+//   2. Throw out any CQs tied to buyers we've decided NOT to make offers for
+//      (the EXCLUDED_BUYERS list below).
+//   3. Figure out which campaign each remaining CQ belongs to, and whether
+//      that campaign is our top-priority "ENT Retail AO" campaign.
+//   4. If there are CQs in the priority Retail campaign AND the buyer is on
+//      our approved retail list, pick the best one of those. Otherwise, pick
+//      the best CQ from all the other ("non-retail") campaigns.
+//   5. Look up a logo image for that buyer.
+//   6. Hand back a big bundle of information (the "outputFields") that the
+//      rest of the HubSpot workflow/email/page uses to personalize what the
+//      contact sees (buyer name, discount amount, logo, etc).
+//
+// If at any point there's nothing usable to show (no CQs, all excluded,
+// missing required info), it hands back a safe "empty" set of fields instead
+// of guessing.
+// ============================================================================
+
 const hubspot = require('@hubspot/api-client');
 
-const CQ_TYPE = '2-66707814';
-const CAMPAIGN_TYPE = '2-66707816';
-const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;
-const PRIORITY_CAMPAIGN_NAME = 'ENT Retail AO campaign';
+// ----------------------------------------------------------------------------
+// CONFIG / CONSTANTS
+// These are the "knobs" for this code — the object types, the name of our
+// top-priority campaign, and a fallback logo image to use if we can't find
+// a real one for the buyer.
+// ----------------------------------------------------------------------------
+const CQ_TYPE = '2-66707814';              // HubSpot custom object: "Campaign Qualification" records
+const CAMPAIGN_TYPE = '2-66707816';        // HubSpot custom object: "Campaign" records
+const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;  // The specific "link type" that connects a CQ to its Campaign
+const PRIORITY_CAMPAIGN_NAME = 'ENT Retail AO campaign'; // Our top-priority campaign name
 const NORMALIZED_PRIORITY_CAMPAIGN_NAME = PRIORITY_CAMPAIGN_NAME.trim().toLowerCase();
 const FALLBACK_LOGO_URL =
-  'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png';
+  'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png'; // Generic logo used when we can't find the buyer's real logo
 
+// ----------------------------------------------------------------------------
+// SMALL HELPER FUNCTIONS
+// These are little utilities used throughout the code to safely convert
+// values (so the code doesn't crash if a field is missing or blank).
+// ----------------------------------------------------------------------------
+
+// Turns any value into a plain text string, and treats "missing" as an empty string
 const text = (value) => (value == null ? '' : String(value));
+
+// Turns a value into a number for comparisons; if it's not really a number,
+// treat it as "as small as possible" so it never wins a priority comparison
 const number = (value) =>
   Number.isFinite(Number(value)) ? Number(value) : Number.NEGATIVE_INFINITY;
+
+// Cleans up a buyer name for comparison purposes: trims spaces, lowercases it,
+// and standardizes curly apostrophes (’) to straight ones (') so
+// "Macy's" always matches "Macy's" regardless of how it was typed
 const normalizeBuyer = (value) =>
   text(value)
     .trim()
     .toLowerCase()
     .replace(/[’‘]/g, "'");
 
+// ----------------------------------------------------------------------------
+// BUYER LISTS (business rules)
+// ----------------------------------------------------------------------------
+
+// RETAIL_ELIGIBLE_BUYERS: only these buyers are allowed to be matched to the
+// top-priority "ENT Retail AO" campaign. If a CQ's buyer isn't on this list,
+// it can't win a spot in that campaign even if it's technically part of it.
 const RETAIL_ELIGIBLE_BUYERS = new Set([
   'Amazon',
   'Walmart',
@@ -36,6 +88,9 @@ const RETAIL_ELIGIBLE_BUYERS = new Set([
   'Sephora'
 ].map(normalizeBuyer));
 
+// EXCLUDED_BUYERS: these buyers are blocked entirely — any Campaign
+// Qualification tied to one of these buyers is thrown out before anything
+// else happens, no matter what campaign it's in.
 const EXCLUDED_BUYERS = new Set([
   'Boots',
   'AMC Theatres',
@@ -132,20 +187,32 @@ const EXCLUDED_BUYERS = new Set([
   'Arçelik'
 ].map(normalizeBuyer));
 
+// ----------------------------------------------------------------------------
+// RELIABILITY HELPERS
+// HubSpot's API occasionally has hiccups (rate limits, brief outages). These
+// three functions make the code automatically wait a moment and try again
+// (up to 2 retries) instead of failing the whole workflow on a blip.
+// ----------------------------------------------------------------------------
+
+// Simple "wait for X milliseconds" helper
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Decides whether an error is the "temporary glitch" kind (worth retrying)
+// vs. a real problem (not worth retrying)
 const retryable = (error) => {
   const status = Number(
     error?.response?.statusCode ?? error?.statusCode ?? error?.status
   );
 
   return (
-    status === 429 ||
-    status >= 500 ||
-    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code)
+    status === 429 || // "too many requests" - rate limited
+    status >= 500 ||   // HubSpot server-side error
+    ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code) // network blip
   );
 };
 
+// Runs a given API call, and if it fails with a "temporary glitch" error,
+// waits briefly and tries again (up to 2 extra attempts) before giving up
 async function withRetry(operation, label) {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -162,11 +229,19 @@ async function withRetry(operation, label) {
   }
 }
 
+// ----------------------------------------------------------------------------
+// READING THE OFFER DETAILS OFF A CQ RECORD
+// Each Campaign Qualification record stores its offer details (buyer name,
+// discount, invoice amounts, etc.) as one big block of JSON text in a field
+// called "payload_json". This function reads that text and turns it into
+// a usable set of values. If the text is broken/invalid, it raises an error
+// so the problem doesn't silently get ignored.
+// ----------------------------------------------------------------------------
 function parsePayload(record) {
   const raw = text(record.properties?.payload_json);
 
   if (!raw.trim()) {
-    return null;
+    return null; // no payload at all — treat as "nothing to offer"
   }
 
   try {
@@ -178,6 +253,13 @@ function parsePayload(record) {
   }
 }
 
+// ----------------------------------------------------------------------------
+// DATE HELPERS
+// ----------------------------------------------------------------------------
+
+// Converts a date-like value (which might be a raw timestamp number or a date
+// string) into a plain number we can compare/sort by. Used to figure out
+// which CQ was generated most recently.
 function timestamp(value) {
   const raw = text(value).trim();
 
@@ -191,6 +273,8 @@ function timestamp(value) {
     : date.getTime();
 }
 
+// Converts a date-like value into a friendly, human-readable date such as
+// "August 20, 2026" for display purposes (e.g. "good funds by" date)
 function formatDate(value) {
   const raw = text(value).trim();
 
@@ -201,7 +285,7 @@ function formatDate(value) {
   const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
 
   return Number.isNaN(date.getTime())
-    ? raw
+    ? raw // if we can't parse it, just show the original text rather than lose it
     : date.toLocaleDateString('en-US', {
         month: 'long',
         day: 'numeric',
@@ -209,6 +293,13 @@ function formatDate(value) {
       });
 }
 
+// ----------------------------------------------------------------------------
+// BUYER / OFFER BUSINESS LOGIC
+// ----------------------------------------------------------------------------
+
+// Reads how many customers/invoices this offer covers ("number of customers"
+// can appear under two slightly different field names in the payload).
+// Returns null if it's missing or not a valid positive number.
 function customerCount(payload) {
   const value =
     payload?.number_of_customers ?? payload?.['number of customers'];
@@ -221,6 +312,9 @@ function customerCount(payload) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+// Labels the offer as "single_buyer" (exactly one customer/invoice covered)
+// or "multi_buyer" (more than one). This flag gets used later in the
+// workflow/email to phrase things correctly ("your invoice" vs "your invoices").
 function buyerFlag(payload) {
   const count = customerCount(payload);
 
@@ -231,6 +325,14 @@ function buyerFlag(payload) {
   return count === 1 ? 'single_buyer' : 'multi_buyer';
 }
 
+// ----------------------------------------------------------------------------
+// "NOTHING TO SHOW" FALLBACK
+// If we can't find a valid offer to present (no CQs, all excluded, or
+// missing required info), this builds a safe, blank set of output fields
+// so the rest of the workflow doesn't break — it just shows no offer.
+// `rawCount` records how many CQ records existed in total, purely for
+// reporting/debugging purposes.
+// ----------------------------------------------------------------------------
 function emptyOutput(rawCount) {
   return {
     matching_cq_count: '0',
@@ -262,7 +364,19 @@ function emptyOutput(rawCount) {
   };
 }
 
+// ----------------------------------------------------------------------------
+// FINDING WHICH CAMPAIGN A CQ RECORD BELONGS TO
+// Every CQ can be linked ("associated") to one or more Campaign records.
+// This function looks up those links, fetches the actual Campaign records,
+// and picks the one that matters most:
+//   - If one of the linked campaigns IS our top-priority "ENT Retail AO"
+//     campaign, that one always wins.
+//   - Otherwise, whichever linked campaign has the highest "priority" number wins.
+// It returns the campaign's name, priority, and "user status" (a setting
+// stored on the campaign that describes what state this contact is in).
+// ----------------------------------------------------------------------------
 async function campaignDetails(client, cqId) {
+  // Step 1: find which Campaign record(s) this CQ is linked to
   const associations = await withRetry(
     () =>
       client.crm.associations.v4.basicApi.getPage(
@@ -284,6 +398,7 @@ async function campaignDetails(client, cqId) {
     .map((item) => text(item.toObjectId))
     .filter(Boolean);
 
+  // No linked campaigns at all — nothing more we can determine
   if (!ids.length) {
     return {
       priority: Number.NEGATIVE_INFINITY,
@@ -294,6 +409,7 @@ async function campaignDetails(client, cqId) {
     };
   }
 
+  // Step 2: fetch the actual Campaign records for those linked IDs
   const response = await withRetry(
     () =>
       client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, {
@@ -314,6 +430,8 @@ async function campaignDetails(client, cqId) {
     `Campaign lookup for CQ ${cqId}`
   );
 
+  // Step 3: decide which linked campaign "wins" —
+  // the priority campaign always wins if present, otherwise highest priority number
   const campaigns = response.results || [];
   const priorityCampaign = campaigns.find(
     (campaign) =>
@@ -340,6 +458,8 @@ async function campaignDetails(client, cqId) {
     };
   }
 
+  // Campaigns store some extra settings (like "userStatus") as JSON text
+  // in a "campaign_config" field — read that here too
   let config = {};
 
   try {
@@ -363,6 +483,13 @@ async function campaignDetails(client, cqId) {
   };
 }
 
+// ----------------------------------------------------------------------------
+// TIE-BREAKER: choosing the "best" CQ between two candidates
+// When there's more than one qualifying CQ to choose from, this decides
+// which one wins:
+//   1. First, whichever is tied to the higher-priority campaign wins.
+//   2. If priority is tied, whichever was generated more recently wins.
+// ----------------------------------------------------------------------------
 function winner(first, second) {
   const priority = number(second.priority) - number(first.priority);
 
@@ -374,19 +501,28 @@ function winner(first, second) {
   return started < 0 ? first : second;
 }
 
+// ============================================================================
+// MAIN ENTRY POINT
+// This is the function HubSpot actually calls when a contact hits this step
+// in the workflow. Everything above was just setup; this is where it all
+// comes together.
+// ============================================================================
 exports.main = async (event, callback) => {
   const client = new hubspot.Client({
     accessToken: process.env.PRIVATE_APP_ACCESS_TOKEN
   });
 
+  // ---- STEP 1: Get the contact's unique ID used to look up their offers ----
   const auth = text(event.inputFields.contact_auth_uuid);
 
+  // No ID on the contact at all? There's nothing to look up — return empty.
   if (!auth) {
     return callback({
       outputFields: emptyOutput(0)
     });
   }
 
+  // ---- STEP 2: Search for this contact's live, unexpired offer records ----
   const response = await withRetry(
     () =>
       client.crm.objects.searchApi.doSearch(CQ_TYPE, {
@@ -401,12 +537,12 @@ exports.main = async (event, callback) => {
               {
                 propertyName: 'payload_kind',
                 operator: 'EQ',
-                value: 'ACTIONABLE_OFFER'
+                value: 'ACTIONABLE_OFFER' // only real, actionable offers — not other record types
               },
               {
                 propertyName: 'expires_at',
                 operator: 'GT',
-                value: String(Date.now())
+                value: String(Date.now()) // only offers that haven't expired yet
               }
             ]
           }
@@ -418,6 +554,8 @@ exports.main = async (event, callback) => {
   );
 
   const records = response.results || [];
+
+  // ---- STEP 3: Remove any records tied to buyers on our exclusion list ----
   const eligible = records.filter((record) => {
     const payload = parsePayload(record);
 
@@ -427,12 +565,16 @@ exports.main = async (event, callback) => {
     );
   });
 
+  // If nothing survives the exclusion filter, there's no offer to show
   if (!eligible.length) {
     return callback({
       outputFields: emptyOutput(records.length)
     });
   }
 
+  // ---- STEP 4: For each surviving record, figure out its campaign details
+  //              (priority, campaign name, user status) and whether its
+  //              buyer is on the approved Retail list ----
   const candidates = await Promise.all(
     eligible.map(async (record) => {
       const payload = parsePayload(record);
@@ -453,6 +595,10 @@ exports.main = async (event, callback) => {
     })
   );
 
+  // ---- STEP 5: Split candidates into two pools ----
+  // Pool A: candidates that ARE in the priority Retail campaign AND whose
+  //         buyer is on the approved retail list (these get first dibs)
+  // Pool B: everything else ("non-retail" candidates)
   const nonRetailCandidates = candidates.filter(
     (candidate) => !candidate.isPriorityCampaign
   );
@@ -460,25 +606,36 @@ exports.main = async (event, callback) => {
     (candidate) =>
       candidate.isPriorityCampaign && candidate.isRetailEligibleBuyer
   );
+
+  // If Pool A has anything in it, we choose from Pool A. Otherwise, choose
+  // from Pool B. (A CQ that's in the priority campaign but NOT for an
+  // approved retail buyer is effectively skipped — it counts toward neither
+  // pool as a candidate to win.)
   const selectionPool =
     eligibleRetailCandidates.length > 0
       ? eligibleRetailCandidates
       : nonRetailCandidates;
+
+  // ---- STEP 6: Pick the single best candidate from the chosen pool ----
+  // (using the tie-breaker rules in the `winner` function above)
   const selected = selectionPool.reduce(
     (current, item) => (current ? winner(current, item) : item),
     null
   );
 
+  // ---- STEP 7: Record a "match status" label describing how we got here,
+  //              mostly useful for reporting/troubleshooting later ----
   let cqMatchStatus = 'none';
 
   if (eligibleRetailCandidates.length > 0) {
-    cqMatchStatus = PRIORITY_CAMPAIGN_NAME;
+    cqMatchStatus = PRIORITY_CAMPAIGN_NAME; // we matched into the priority Retail campaign
   } else if (nonRetailCandidates.length === 1) {
-    cqMatchStatus = 'one_match';
+    cqMatchStatus = 'one_match'; // exactly one non-retail candidate available
   } else if (nonRetailCandidates.length > 1) {
-    cqMatchStatus = 'multiple_matches';
+    cqMatchStatus = 'multiple_matches'; // had to pick a winner among several non-retail candidates
   }
 
+  // ---- STEP 8: Log what happened, for visibility in HubSpot's workflow logs ----
   if (cqMatchStatus === PRIORITY_CAMPAIGN_NAME) {
     console.log(
       `cq_match_status=${PRIORITY_CAMPAIGN_NAME}: selected an eligible ENT Retail CQ for an approved buyer, taking precedence over ${nonRetailCandidates.length} qualifying non-retail CQ(s).`
@@ -498,6 +655,10 @@ exports.main = async (event, callback) => {
     );
   }
 
+  // ---- STEP 9: Sanity check the winning record before using it ----
+  // If the record we picked is missing critical info (buyer name, buyer
+  // permalink, buyer division ID, or a valid customer count), we don't try
+  // to guess — we bail out and show nothing rather than a broken offer.
   if (
     !selected?.raw ||
     !text(selected.payload?.primary_buyer_name).trim() ||
@@ -520,6 +681,10 @@ exports.main = async (event, callback) => {
   const buyerDivisionUuid = text(payload.primary_buyer_division_uuid).trim();
   const flag = buyerFlag(payload);
 
+  // ---- STEP 10: Look up a logo image for this buyer ----
+  // We check a HubDB table ("buyer_logos") for a matching row. If anything
+  // goes wrong (buyer not found, lookup fails, etc.), we just fall back to
+  // the generic C2FO logo rather than failing the whole workflow step.
   let logo = FALLBACK_LOGO_URL;
 
   try {
@@ -546,6 +711,9 @@ exports.main = async (event, callback) => {
     console.log(`Buyer logo lookup failed: ${error.message || error}`);
   }
 
+  // ---- STEP 11: Hand everything back to the workflow ----
+  // This bundle of fields is what the rest of the HubSpot workflow (emails,
+  // landing pages, personalization tokens, etc.) will use.
   callback({
     outputFields: {
       matching_cq_count: String(
