@@ -112,16 +112,16 @@
 //                                the priority + recency tie-break.
 //   "none"                    -> no qualifying CQ at all.
 // ============================================================================
-
+ 
 const hubspot = require('@hubspot/api-client');
-
+ 
 // ----------------------------------------------------------------------------
 // CONFIG / CONSTANTS
 // ----------------------------------------------------------------------------
 const CQ_TYPE = '2-66707814';              // HubSpot custom object: "Campaign Qualification" records
 const CAMPAIGN_TYPE = '2-66707816';        // HubSpot custom object: "Campaign" records
 const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;  // The specific "link type" that connects a CQ to its Campaign
-
+ 
 // REDUCED_RATE_MATCH_STATUS is the new highest priority tier of all — it
 // outranks EVERYTHING else, including Lapse & Attrited and Retail below.
 // Unlike those two, it isn't tied to one specific campaign name: any
@@ -129,51 +129,55 @@ const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;  // The specific "link type" that conn
 // qualifies, so multiple buyer-specific Reduced Rate campaigns can all feed
 // into this same tier. See REDUCED RATE DETECTION above.
 const REDUCED_RATE_MATCH_STATUS = 'Reduced Rate campaign';
-
+ 
 // TOP_PRIORITY_CAMPAIGN_NAME outranks everything except Reduced Rate above.
 // Unlike Retail below, there's no buyer allowlist for this one — any CQ tied
 // to this campaign (that survives the EXCLUDED_BUYERS check) wins
 // automatically.
 const TOP_PRIORITY_CAMPAIGN_NAME = 'Lapse & Attrited text AO campaign';
 const NORMALIZED_TOP_PRIORITY_CAMPAIGN_NAME = TOP_PRIORITY_CAMPAIGN_NAME.trim().toLowerCase();
-
+ 
 const PRIORITY_CAMPAIGN_NAME = 'ENT Retail AO campaign'; // Our third-priority campaign name (approved retail buyers only)
 const NORMALIZED_PRIORITY_CAMPAIGN_NAME = PRIORITY_CAMPAIGN_NAME.trim().toLowerCase();
 const FALLBACK_LOGO_URL =
   'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png'; // Generic logo used when we can't find the buyer's real logo
 const PAYLOAD_PROPERTY = 'payload_json';
-
+ 
+// AO suppression: read the CQ's consumed checkbox and stable source qualification key.
+const AO_SENT_PROPERTY = 'ao_email_sent';
+const SOURCE_QUALIFICATION_PROPERTY = 'source_qualification_id';
+ 
 // ----------------------------------------------------------------------------
 // SMALL HELPER FUNCTIONS
 // ----------------------------------------------------------------------------
 const text = (value) => (value == null ? '' : String(value));
-
+ 
 const number = (value) =>
   Number.isFinite(Number(value)) ? Number(value) : Number.NEGATIVE_INFINITY;
-
+ 
 const floorToTwoDecimals = (value) => {
   const parsed = Number(value);
-
+ 
   if (!Number.isFinite(parsed)) {
     return text(value);
   }
-
+ 
   return (Math.floor(parsed * 100) / 100).toFixed(2);
 };
-
+ 
 const normalizeBuyer = (value) =>
   text(value)
     .trim()
     .toLowerCase()
     .replace(/[’‘]/g, "'");
-
+ 
 const normalizeOfferType = (value) =>
   text(value)
     .trim()
     .toLowerCase()
     .replace(/_/g, '-')
     .replace(/\s+/g, '-');
-
+ 
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -182,7 +186,7 @@ function escapeHtml(value) {
     .replace(/\"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
-
+ 
 // ----------------------------------------------------------------------------
 // BUYER LISTS (business rules)
 // ----------------------------------------------------------------------------
@@ -204,7 +208,7 @@ const RETAIL_ELIGIBLE_BUYERS = new Set([
   'REI',
   'Sephora'
 ].map(normalizeBuyer));
-
+ 
 const EXCLUDED_BUYERS = new Set([
   'Boots', 'AMC Theatres', 'Anadolu Efes', 'Aperam', 'Apple', 'Asda',
   'Ashirvad Pipes Private Limited', 'AutoNation', 'Berger Paints', 'Caleres',
@@ -229,24 +233,24 @@ const EXCLUDED_BUYERS = new Set([
   'Uber', 'Unilever China', 'UNFI', 'VECV Funder', 'Wabtec', 'Arcelik',
   'Arçelik'
 ].map(normalizeBuyer));
-
+ 
 // ----------------------------------------------------------------------------
 // RELIABILITY HELPERS
 // ----------------------------------------------------------------------------
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
+ 
 const retryable = (error) => {
   const status = Number(
     error?.response?.statusCode ?? error?.statusCode ?? error?.status
   );
-
+ 
   return (
     status === 429 ||
     status >= 500 ||
     ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code)
   );
 };
-
+ 
 async function withRetry(operation, label) {
   for (let attempt = 0; ; attempt += 1) {
     try {
@@ -255,24 +259,60 @@ async function withRetry(operation, label) {
       if (!retryable(error) || attempt >= 2) {
         throw error;
       }
-
+ 
       const wait = 250 * (attempt + 1);
       console.log(`${label} transient failure; retrying in ${wait}ms`);
       await sleep(wait);
     }
   }
 }
-
+ 
+// Read every page so prior sent assets are not missed.
+// Stop with an error rather than use a partial population at the safety cap.
+// This helper performs reads only; it never marks a CQ sent.
+async function searchAllCqs(client, request) {
+  const results = [];
+  let after;
+  const seenCursors = new Set();
+ 
+  for (let page = 0; page < 100; page += 1) {
+    const pageRequest = { ...request };
+    if (after != null) pageRequest.after = after;
+ 
+    const response = await withRetry(
+      () => client.crm.objects.searchApi.doSearch(CQ_TYPE, pageRequest),
+      'Campaign Qualification search page'
+    );
+ 
+    results.push(...(response.results || []));
+    const next = response.paging?.next?.after;
+    if (next == null) return { results };
+ 
+    const cursor = String(next);
+    if (seenCursors.has(cursor)) {
+      throw new Error('CQ search returned a repeated pagination cursor');
+    }
+    seenCursors.add(cursor);
+    after = next;
+  }
+ 
+  throw new Error('CQ search exceeded its page safety limit; refusing partial selection');
+}
+ 
+function aoCheckboxIsTrue(value) {
+  return text(value).trim().toLowerCase() === 'true';
+}
+ 
 // ----------------------------------------------------------------------------
 // READING THE OFFER DETAILS OFF A CQ RECORD
 // ----------------------------------------------------------------------------
 function parsePayload(record) {
   const raw = text(record.properties?.[PAYLOAD_PROPERTY]);
-
+ 
   if (!raw.trim()) {
     return null;
   }
-
+ 
   try {
     return JSON.parse(raw);
   } catch {
@@ -281,32 +321,32 @@ function parsePayload(record) {
     );
   }
 }
-
+ 
 // ----------------------------------------------------------------------------
 // DATE HELPERS
 // ----------------------------------------------------------------------------
 function timestamp(value) {
   const raw = text(value).trim();
-
+ 
   if (!raw) {
     return Number.NEGATIVE_INFINITY;
   }
-
+ 
   const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
   return Number.isNaN(date.getTime())
     ? Number.NEGATIVE_INFINITY
     : date.getTime();
 }
-
+ 
 function formatDate(value) {
   const raw = text(value).trim();
-
+ 
   if (!raw) {
     return '';
   }
-
+ 
   const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
-
+ 
   return Number.isNaN(date.getTime())
     ? raw
     : date.toLocaleDateString('en-US', {
@@ -315,32 +355,32 @@ function formatDate(value) {
         year: 'numeric'
       });
 }
-
+ 
 // ----------------------------------------------------------------------------
 // BUYER / OFFER BUSINESS LOGIC
 // ----------------------------------------------------------------------------
 function customerCount(payload) {
   const value =
     payload?.number_of_customers ?? payload?.['number of customers'];
-
+ 
   if (value == null || text(value).trim() === '') {
     return null;
   }
-
+ 
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
-
+ 
 function buyerFlag(payload) {
   const count = customerCount(payload);
-
+ 
   if (count == null) {
     return null;
   }
-
+ 
   return count === 1 ? 'single_buyer' : 'multi_buyer';
 }
-
+ 
 // Classifies a normalized offer_type (from a CQ's payload_json) into the two
 // kinds the offers table knows how to display. Returns null for anything else.
 function offerKind(offerType) {
@@ -348,7 +388,7 @@ function offerKind(offerType) {
   if (offerType.startsWith('express-accept')) return 'onetime';
   return null;
 }
-
+ 
 // Reads a campaign's `campaign_config.draftOfferAssets` and answers: is this
 // campaign configured to generate MORE THAN ONE offer type per qualifying
 // run? (e.g. draftOfferAssets: [{ offerTypes: ["PREFERRED","EXPRESS_ACCEPT"] }])
@@ -359,7 +399,7 @@ function isMultiOfferCampaign(candidate) {
     (asset) => Array.isArray(asset?.offerTypes) && asset.offerTypes.length > 1
   );
 }
-
+ 
 // Reads a campaign's `campaign_config.draftOfferAssets` and answers: is this
 // a Reduced Rate campaign — i.e. does ANY draft offer asset use a fixed,
 // pre-set discount rate (`rateSourceKind: "fixed"`) instead of a normal
@@ -371,7 +411,7 @@ function isReducedRateCampaignConfig(draftOfferAssets) {
     (asset) => text(asset?.rateSourceKind).trim().toLowerCase() === 'fixed'
   );
 }
-
+ 
 // ----------------------------------------------------------------------------
 // "NOTHING TO SHOW" FALLBACK
 // ----------------------------------------------------------------------------
@@ -382,6 +422,7 @@ function emptyOutput(rawCount) {
     cq_match_status: 'none',
     buyer_count_flag: '',
     selected_offers_json: '[]',
+    email_cqs_json: '[]',
     selected_primary_cq_id: '',
     selected_primary_payload_json: '',
     draft_offers_table: '',
@@ -407,7 +448,7 @@ function emptyOutput(rawCount) {
     standard_rate_type: ''
   };
 }
-
+ 
 // ----------------------------------------------------------------------------
 // FINDING WHICH CAMPAIGN A CQ RECORD BELONGS TO
 // ----------------------------------------------------------------------------
@@ -423,7 +464,7 @@ async function campaignDetails(client, cqId) {
       ),
     `CQ ${cqId} association lookup`
   );
-
+ 
   const ids = (associations.results || [])
     .filter(
       (item) =>
@@ -432,7 +473,7 @@ async function campaignDetails(client, cqId) {
     )
     .map((item) => text(item.toObjectId))
     .filter(Boolean);
-
+ 
   if (!ids.length) {
     return {
       priority: Number.NEGATIVE_INFINITY,
@@ -447,7 +488,7 @@ async function campaignDetails(client, cqId) {
       draftOfferAssets: []
     };
   }
-
+ 
   const response = await withRetry(
     () =>
       client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, {
@@ -467,7 +508,7 @@ async function campaignDetails(client, cqId) {
       }),
     `Campaign lookup for CQ ${cqId}`
   );
-
+ 
   const campaigns = response.results || [];
   const topPriorityCampaign = campaigns.find(
     (campaign) =>
@@ -495,7 +536,7 @@ async function campaignDetails(client, cqId) {
           number(b.properties?.campaign_priority) -
           number(a.properties?.campaign_priority)
       )[0];
-
+ 
   if (!campaign) {
     return {
       priority: Number.NEGATIVE_INFINITY,
@@ -510,9 +551,9 @@ async function campaignDetails(client, cqId) {
       draftOfferAssets: []
     };
   }
-
+ 
   let config = {};
-
+ 
   try {
     config = campaign.properties?.campaign_config
       ? JSON.parse(campaign.properties.campaign_config)
@@ -522,13 +563,13 @@ async function campaignDetails(client, cqId) {
       `AO Campaign ${campaign.id} campaign_config is not valid JSON`
     );
   }
-
+ 
   const campaignName = text(campaign.properties?.campaign_name).trim();
   const normalizedCampaignName = campaignName.toLowerCase();
   const draftOfferAssets = Array.isArray(config.draftOfferAssets)
     ? config.draftOfferAssets
     : [];
-
+ 
   return {
     campaignId: text(campaign.id),
     campaignIds: ids,
@@ -543,7 +584,7 @@ async function campaignDetails(client, cqId) {
     draftOfferAssets
   };
 }
-
+ 
 // ----------------------------------------------------------------------------
 // TIE-BREAKER: choosing the "best" CQ between two candidates
 //   1. Whichever is tied to the higher-priority campaign wins.
@@ -552,15 +593,15 @@ async function campaignDetails(client, cqId) {
 // ----------------------------------------------------------------------------
 function winner(first, second) {
   const priority = number(second.priority) - number(first.priority);
-
+ 
   if (priority) {
     return priority < 0 ? first : second;
   }
-
+ 
   const started = timestamp(second.started) - timestamp(first.started);
   return started < 0 ? first : second;
 }
-
+ 
 // ----------------------------------------------------------------------------
 // DRAFT OFFERS TABLE (locale-aware, side-by-side comparison table)
 // ----------------------------------------------------------------------------
@@ -571,7 +612,7 @@ function resolveLocale(rawLanguage) {
   }
   return 'en';
 }
-
+ 
 const LOCALES = {
   en: {
     preferredTitle: 'Preferred',
@@ -629,20 +670,29 @@ const LOCALES = {
 // NOTE: labels were shortened (e.g. "Discount Amount" -> "Discount",
 // "Early Payment Frequency" -> "Frequency") to match the latest sample HTML
 // design, which reads cleaner on a narrow mobile column.
-
+ 
+// Format MXN monetary values consistently in tables and workflow outputs.
+// The currency field controls formatting; no currency conversion occurs.
+// Remove existing peso prefixes or an MXN suffix to avoid duplicate labels.
+// Preserve the amount's existing commas and decimal precision.
 function formatTableCurrency(value, currency) {
   const amount = text(value).trim();
-
+ 
   if (text(currency).trim().toUpperCase() !== 'MXN' || !amount) {
     return amount;
   }
-
-  return `MX$${amount.replace(/^(?:MX\$|\$)\s*/, '')}`;
+ 
+  const cleanAmount = amount
+    .replace(/^(?:MX\s*\$|MXN\s*\$?|\$)\s*/i, '')
+    .replace(/\s*MXN$/i, '')
+    .trim();
+ 
+  return cleanAmount ? `MX $${cleanAmount}` : '';
 }
-
+ 
 function columnForOffer(offerType, payload, offerId, t) {
   const kind = offerKind(offerType);
-
+ 
   if (kind === 'preferred') {
     return {
       sortOrder: 0,
@@ -664,7 +714,7 @@ function columnForOffer(offerType, payload, offerId, t) {
       whyBullets: t.whyPreferredBullets
     };
   }
-
+ 
   if (kind === 'onetime') {
     return {
       sortOrder: 1,
@@ -686,29 +736,29 @@ function columnForOffer(offerType, payload, offerId, t) {
       whyBullets: t.whyOneTimeBullets
     };
   }
-
+ 
   return null;
 }
-
+ 
 function buildComparisonTable(offers, t) {
   const borderColor = '#E5E7EB';
   const labelColWidth = '34%';
   const dataColWidth = `${Math.floor(66 / Math.max(offers.length, 1))}%`;
-
+ 
   // Fixed-format cells (currency, %, fixed phrases like "One time only"):
   // never break internally. white-space:nowrap alone is NOT enough — a
   // client that boosts font size (or inherits HubSpot's break-word rule)
   // can still force a break inside the value, so word-break/overflow-wrap
   // are reset explicitly on every one of these cells.
   const fixedCellStyle = 'white-space:nowrap;word-break:normal;overflow-wrap:normal;';
-
+ 
   // Label cells: short but locale-variable ("Rate" vs "Frecuencia"). Allowed
   // to wrap onto a 2nd line at a word boundary — never forced nowrap (which
   // would blow out the column for a longer locale) and never inheriting
   // HubSpot's break-word (which is what fragmented "Discount Amount" into
   // "Disc/ount Amo/unt" on mobile).
   const labelCellStyle = 'white-space:normal;word-break:normal;overflow-wrap:break-word;';
-
+ 
   const headerCells = offers
     .map((o) => {
       const badge = o.recommended
@@ -717,7 +767,7 @@ function buildComparisonTable(offers, t) {
       return `<td width="${dataColWidth}" style="background:${o.headerBg};padding:12px 6px;text-align:center;border-bottom:2px solid ${o.headerBorder};border-radius:6px 6px 0 0;${fixedCellStyle}">${badge}<span style="font-size:15px;font-weight:700;color:${o.titleColor};">${escapeHtml(o.title)}</span></td>`;
     })
     .join('');
-
+ 
   const rowDefs = [
     { label: t.currentAR, render: (o) => escapeHtml(o.ar) },
     { label: t.rate, render: (o) => t.fixedApr(escapeHtml(o.ratePercent)) },
@@ -729,7 +779,7 @@ function buildComparisonTable(offers, t) {
     { label: t.earlyPaymentFrequency, render: (o) => escapeHtml(o.frequencyLabel) },
     { label: t.paymentGuaranteed, render: () => '<span style="color:#10B981;font-weight:bold;">&#10003;</span>' }
   ];
-
+ 
   const dataRows = rowDefs
     .map((row, rowIndex) => {
       const stripe = rowIndex % 2 === 0;
@@ -742,7 +792,7 @@ function buildComparisonTable(offers, t) {
       return `<tr><td width="${labelColWidth}" style="padding:8px 8px;font-weight:600;font-size:12px;color:#4B5563;border-bottom:1px solid ${borderColor};vertical-align:middle;background-color:${stripe ? '#ffffff' : '#F9FAFB'};line-height:1.3;${labelCellStyle}">${escapeHtml(row.label)}:</td>${cells}</tr>`;
     })
     .join('');
-
+ 
   const whyCells = offers
     .map((o) => {
       const bullets = o.whyBullets
@@ -755,7 +805,7 @@ function buildComparisonTable(offers, t) {
     })
     .join('');
   const whyRow = `<tr><td width="${labelColWidth}" style="padding:10px 8px;background-color:#ffffff;"></td>${whyCells}</tr>`;
-
+ 
   const buttonCells = offers
     .map(
       (o) =>
@@ -763,7 +813,7 @@ function buildComparisonTable(offers, t) {
     )
     .join('');
   const buttonRow = `<tr><td width="${labelColWidth}" style="background-color:#ffffff;"></td>${buttonCells}</tr>`;
-
+ 
   return `
 <div style="width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;-webkit-text-size-adjust:100%;text-size-adjust:100%;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:560px;margin:0 auto;border-collapse:separate;border-spacing:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;-webkit-text-size-adjust:100%;text-size-adjust:100%;">
@@ -777,7 +827,7 @@ ${buttonRow}
 </table>
 </div>`.trim();
 }
-
+ 
 // ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
@@ -785,20 +835,54 @@ exports.main = async (event, callback) => {
   const client = new hubspot.Client({
     accessToken: process.env.PRIVATE_APP_ACCESS_TOKEN
   });
-
+ 
   // ---- STEP 1: Get the contact's unique ID and preferred language ----
   const auth = text(event.inputFields.contact_auth_uuid);
   const locale = resolveLocale(event.inputFields.contact_email_language);
   const t = LOCALES[locale];
-
+ 
   if (!auth) {
     return callback({ outputFields: emptyOutput(0) });
   }
-
+ 
+  // AO suppression history: include expired CQs for this same recipient.
+  // The separate post-send action sets ao_email_sent after Send email is exited.
+  const sentResponse = await searchAllCqs(client, {
+    filterGroups: [
+      {
+        filters: [
+          {
+            propertyName: 'recipient_auth_service_uuid',
+            operator: 'EQ',
+            value: auth
+          },
+          {
+            propertyName: 'payload_kind',
+            operator: 'EQ',
+            value: 'ACTIONABLE_OFFER'
+          },
+          {
+            propertyName: AO_SENT_PROPERTY,
+            operator: 'EQ',
+            value: 'true'
+          }
+        ]
+      }
+    ],
+    properties: [SOURCE_QUALIFICATION_PROPERTY],
+    limit: 100
+  });
+ 
+  const sentSourceQualificationIds = new Set(
+    sentResponse.results
+      .map((record) => text(record.properties?.[SOURCE_QUALIFICATION_PROPERTY]).trim())
+      .filter(Boolean)
+  );
+ 
   // ---- STEP 2: Search for this contact's live, unexpired offer records ----
   const response = await withRetry(
     () =>
-      client.crm.objects.searchApi.doSearch(CQ_TYPE, {
+      searchAllCqs(client, {
         filterGroups: [
           {
             filters: [
@@ -820,27 +904,49 @@ exports.main = async (event, callback) => {
             ]
           }
         ],
-        properties: ['payload_json', 'source_run_started_at', 'expires_at'],
+        properties: [
+          'payload_json',
+          'source_run_started_at',
+          'expires_at',
+          SOURCE_QUALIFICATION_PROPERTY,
+          AO_SENT_PROPERTY
+        ],
         limit: 100
       }),
     'Campaign Qualification search'
   );
-
+ 
   const records = response.results || [];
-
+ 
+  // Remove already-consumed CQs/assets before campaign lookups and ranking.
+  // Blank asset IDs remain eligible to preserve original selection behavior.
+  // They are blocked at the final handoff below rather than silently consumed.
+  const unsentRecords = records.filter((record) => {
+    if (aoCheckboxIsTrue(record.properties?.[AO_SENT_PROPERTY])) {
+      return false;
+    }
+ 
+    const sourceQualificationId = text(
+      record.properties?.[SOURCE_QUALIFICATION_PROPERTY]
+    ).trim();
+ 
+    return !sourceQualificationId || !sentSourceQualificationIds.has(sourceQualificationId);
+  });
+ 
   // ---- STEP 3: Load each CQ's campaign details, then remove any records
   //              tied to excluded buyers. ----
   const candidates = await Promise.all(
-    records.map(async (record) => {
+    unsentRecords.map(async (record) => {
       const payload = parsePayload(record);
       const buyerName = text(payload?.primary_buyer_name).trim();
       const buyerPermalink = text(payload?.primary_buyer_permalink).trim().toLowerCase();
       const offerType = normalizeOfferType(payload?.offer_type);
       const details = await campaignDetails(client, record.id);
-
+ 
       return {
         ...details,
         id: text(record.id),
+        sourceQualificationId: text(record.properties?.[SOURCE_QUALIFICATION_PROPERTY]).trim(),
         raw: text(record.properties?.[PAYLOAD_PROPERTY]),
         payload,
         buyerName,
@@ -854,22 +960,22 @@ exports.main = async (event, callback) => {
       };
     })
   );
-
+ 
   const eligible = candidates.filter(
     (candidate) =>
       candidate.payload &&
       !EXCLUDED_BUYERS.has(normalizeBuyer(candidate.payload.primary_buyer_name))
   );
-
+ 
   if (!eligible.length) {
     return callback({ outputFields: emptyOutput(records.length) });
   }
-
+ 
   // ---- STEP 4: For each surviving record, we already know its campaign
   //              details (including whether that campaign is configured for
   //              more than one offer type, and whether it's a Reduced Rate
   //              campaign) and its own offer type/kind ----
-
+ 
   // ---- STEP 5: Split candidates into four pools, highest priority first.
   //              Reduced Rate is checked (and excluded from every pool
   //              below it) first, since it now outranks everything. ----
@@ -892,7 +998,7 @@ exports.main = async (event, callback) => {
       !candidate.isTopPriorityCampaign &&
       !candidate.isReducedRateCampaign
   );
-
+ 
   const selectionPool =
     reducedRateCandidates.length > 0
       ? reducedRateCandidates
@@ -901,13 +1007,13 @@ exports.main = async (event, callback) => {
         : eligibleRetailCandidates.length > 0
           ? eligibleRetailCandidates
           : nonRetailCandidates;
-
+ 
   // ---- STEP 6: Pick the single best candidate from the chosen pool ----
   const selected = selectionPool.reduce(
     (current, item) => (current ? winner(current, item) : item),
     null
   );
-
+ 
   // ---- STEP 7: Group the winner with any other CQ from the exact same
   //              campaign + same campaign run (source_run_started_at) —
   //              this is what powers both cq_match_status and the offers
@@ -916,10 +1022,10 @@ exports.main = async (event, callback) => {
   //              this way at all. ----
   let cqMatchStatus = 'none';
   let sameRunGroup = [];
-
+ 
   if (selected) {
     const multiOfferConfigured = isMultiOfferCampaign(selected);
-
+ 
     sameRunGroup =
       multiOfferConfigured && selected.started
         ? eligible.filter(
@@ -929,7 +1035,7 @@ exports.main = async (event, callback) => {
               text(candidate.started) === text(selected.started)
           )
         : [selected];
-
+ 
     if (reducedRateCandidates.length > 0) {
       cqMatchStatus = REDUCED_RATE_MATCH_STATUS;
     } else if (topPriorityCandidates.length > 0) {
@@ -946,7 +1052,7 @@ exports.main = async (event, callback) => {
       cqMatchStatus = 'one_match';
     }
   }
-
+ 
   // ---- STEP 8: Log what happened, for visibility in HubSpot's workflow logs ----
   if (cqMatchStatus === REDUCED_RATE_MATCH_STATUS) {
     console.log(
@@ -968,7 +1074,7 @@ exports.main = async (event, callback) => {
         !candidate.isTopPriorityCampaign &&
         !candidate.isReducedRateCampaign
     ).length;
-
+ 
     console.log(
       `cq_match_status=${cqMatchStatus}: selected from ${nonRetailCandidates.length} qualifying non-retail CQ(s) (offers table built from ${sameRunGroup.length} CQ(s) in the same campaign run). Ignored ${excludedRetailCount} ineligible retail CQ(s).`
     );
@@ -977,7 +1083,7 @@ exports.main = async (event, callback) => {
       `cq_match_status=none: no qualifying CQ was found in Reduced Rate, the top-priority campaign, the Retail priority campaign, or any other eligible campaign.`
     );
   }
-
+ 
   // ---- STEP 9: Sanity check the winning record before using it ----
   if (
     !selected?.raw ||
@@ -989,16 +1095,16 @@ exports.main = async (event, callback) => {
     console.log(
       'Winning Campaign Qualification is missing buyer identity, buyer division UUID, or a valid number of customers'
     );
-
+ 
     return callback({ outputFields: emptyOutput(records.length) });
   }
-
+ 
   const payload = selected.payload;
   const buyerName = text(payload.primary_buyer_name).trim();
   const buyerPermalink = text(payload.primary_buyer_permalink).trim();
   const buyerDivisionUuid = text(payload.primary_buyer_division_uuid).trim();
   const flag = buyerFlag(payload);
-
+ 
   // The pre-discount ("standard") rate for a Reduced Rate winner lives in
   // the CQ payload's `original_pricing` block. For every other campaign
   // type this block won't be present, so these just come back blank — safe
@@ -1008,10 +1114,10 @@ const standardRate = Number.isFinite(Number(standardRateRaw))
   ? Number(standardRateRaw).toFixed(2)
   : text(standardRateRaw);
 const standardRateType = text(payload.original_pricing?.rate_type);
-
+ 
   // ---- STEP 10: Look up a logo image for this buyer ----
   let logo = FALLBACK_LOGO_URL;
-
+ 
   try {
     const logoResponse = await withRetry(
       () =>
@@ -1026,7 +1132,7 @@ const standardRateType = text(payload.original_pricing?.rate_type);
         }),
       'Buyer logo lookup'
     );
-
+ 
     const value = (await logoResponse.json()).results?.[0]?.values?.logo_url;
     logo =
       typeof value === 'string' && value
@@ -1035,7 +1141,7 @@ const standardRateType = text(payload.original_pricing?.rate_type);
   } catch (error) {
     console.log(`Buyer logo lookup failed: ${error.message || error}`);
   }
-
+ 
   // ---- STEP 11: Build the draft offers table from sameRunGroup — one
   //               column per recognized offer type, in Preferred-then-
   //               One-Time order. ----
@@ -1045,13 +1151,44 @@ const standardRateType = text(payload.original_pricing?.rate_type);
     )
     .filter(Boolean)
     .sort((a, b) => a.sortOrder - b.sortOrder);
-
+ 
   const draftOffersTable = tableColumns.length ? buildComparisonTable(tableColumns, t) : '';
-
+ 
   console.log(
     `Built draft offers table (locale=${locale}, buyer=${selected.buyerPermalink || 'unknown'}, campaign=${selected.campaignName || 'unknown'}, reducedRate=${selected.isReducedRateCampaign}) from ${sameRunGroup.length} CQ(s).`
   );
-
+ 
+  // Handoff ONLY the CQs represented in this path's email.
+  // multiple_matches is the only path that displays the comparison table.
+  // The original table ignores unrecognized offer kinds; so does this list.
+  // Other sending paths include only the primary winning CQ.
+  const emailCandidates = cqMatchStatus === 'multiple_matches'
+    ? sameRunGroup.filter((candidate) =>
+        Boolean(columnForOffer(
+          candidate.offerType,
+          candidate.payload,
+          candidate.payload.draft_offer_uuid,
+          t
+        ))
+      )
+    : [selected];
+ 
+  // Do not return a sendable selection that the post-send action cannot track.
+  // Unlike the earlier draft, this does not silently filter missing-ID offers
+  // out of the ranking pool; it reports the missing data for review.
+  if (!emailCandidates.length || emailCandidates.some(
+    (candidate) => !candidate.sourceQualificationId
+  )) {
+    throw new Error('Selected email CQ is missing a Source Qualification ID, or comparison has no renderable offers');
+  }
+ 
+  const emailCqsJson = JSON.stringify(
+    emailCandidates.map((candidate) => ({
+      cq_id: candidate.id,
+      source_qualification_id: candidate.sourceQualificationId
+    }))
+  );
+ 
   // ---- STEP 12: Hand everything back to the workflow ----
   callback({
     outputFields: {
@@ -1059,6 +1196,7 @@ const standardRateType = text(payload.original_pricing?.rate_type);
       raw_matching_cq_count: String(records.length),
       cq_match_status: cqMatchStatus,
       buyer_count_flag: flag,
+      email_cqs_json: emailCqsJson,
       selected_offers_json: JSON.stringify(
         sameRunGroup.map((candidate) => ({
           cq_id: candidate.id,
@@ -1075,10 +1213,19 @@ const standardRateType = text(payload.original_pricing?.rate_type);
       buyer_logo_url: logo,
       auth_service_uuid: text(payload.auth_service_uuid),
       currency: text(payload.currency),
-      discount_amount: text(payload.discount_amount),
-      discounted_amount: text(payload.discounted_amount),
+      discount_amount: formatTableCurrency(
+        payload.discount_amount,
+        payload.currency
+      ),
+      discounted_amount: formatTableCurrency(
+        payload.discounted_amount,
+        payload.currency
+      ),
       draft_offer_uuid: text(payload.draft_offer_uuid),
-      eligible_invoice_amount: text(payload.eligible_invoice_amount),
+      eligible_invoice_amount: formatTableCurrency(
+        payload.eligible_invoice_amount,
+        payload.currency
+      ),
       good_funds_date_picker: formatDate(
         payload.good_funds_date_picker || payload.good_funds_date
       ),
@@ -1102,3 +1249,5 @@ const standardRateType = text(payload.original_pricing?.rate_type);
     }
   });
 };
+ 
+
