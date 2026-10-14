@@ -612,6 +612,38 @@ function resolveLocale(rawLanguage) {
   }
   return 'en';
 }
+
+// Detects Simplified or Traditional Chinese from the contact's language value.
+// Covers codes like zh, zh-CN, zh_TW, zh-Hans, zh-Hant, and spelled-out
+// values like "Chinese (Simplified)" or "Traditional Chinese".
+function isChineseLanguage(rawLanguage) {
+  const normalized = text(rawLanguage).trim().toLowerCase();
+  return (
+    normalized === 'zh' ||
+    normalized.startsWith('zh-') ||
+    normalized.startsWith('zh_') ||
+    normalized.includes('chinese') ||
+    normalized.includes('中文') ||
+    normalized.includes('简体') ||
+    normalized.includes('繁體') ||
+    normalized.includes('繁体')
+  );
+}
+
+// Same wording is used for Simplified and Traditional Chinese.
+const CHINESE_RATE_TYPES = {
+  APR: '年利率',
+  DISC: '折扣'
+};
+
+// Returns the Chinese label for APR / DISC when the contact's language is
+// Chinese. Anything else (other languages, unexpected rate types, blanks)
+// comes back unchanged.
+function formatRateType(rateType, rawLanguage) {
+  const original = text(rateType);
+  if (!isChineseLanguage(rawLanguage)) return original;
+  return CHINESE_RATE_TYPES[original.trim().toUpperCase()] || original;
+}
  
 const LOCALES = {
   en: {
@@ -840,6 +872,7 @@ exports.main = async (event, callback) => {
   const auth = text(event.inputFields.contact_auth_uuid);
   const locale = resolveLocale(event.inputFields.contact_email_language);
   const t = LOCALES[locale];
+  const contactLanguage = event.inputFields.contact_email_language;
  
   if (!auth) {
     return callback({ outputFields: emptyOutput(0) });
@@ -1243,9 +1276,9 @@ const standardRateType = text(payload.original_pricing?.rate_type);
       rate: Number.isFinite(Number(payload.rate))
         ? Number(payload.rate).toFixed(2)
         : text(payload.rate),
-      rate_type: text(payload.rate_type),
+      rate_type: formatRateType(payload.rate_type, contactLanguage),
       standard_rate: standardRate,
-      standard_rate_type: standardRateType
+      standard_rate_type: formatRateType(standardRateType, contactLanguage)
     }
   });
 };
