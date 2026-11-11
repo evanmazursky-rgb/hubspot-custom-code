@@ -1,0 +1,1693 @@
+// ============================================================================
+// DIVISION EAP TARGETING EMAIL: BUYER ROLL-UP  (HubSpot workflow custom code, Node 24)
+// ----------------------------------------------------------------------------
+// WHAT THIS CODE DOES (big picture)
+//
+// Runs once per contact inside a CONTACT-based workflow, right before the
+// "Send email" step. For that contact it:
+//
+//   1. Finds the Company (or Companies) the contact belongs to.
+//   2. Finds every Division on that Company that has eligible AP.
+//   3. Finds which of those Divisions the contact is ALSO associated to.
+//   4. Rolls everything up by UNIQUE BUYER (buyer_division_uuid) so each buyer
+//      appears once, no matter how many Divisions it has.
+//   5. Marks each buyer as:
+//        ASSOCIATED - the contact is tied to at least one of that buyer's
+//                     Divisions  -> shown as a normal invoice-alert row.
+//        MISSING    - the Company has eligible Divisions for that buyer but
+//                     the contact is tied to none of them -> shown in the
+//                     "Did you know <company> has multiple customers..." block.
+//   6. Hands back ready-to-drop-in HTML blocks plus a few small values
+//      (outputFields) that the workflow/email uses, same pattern as the
+//      Actionable Offer V3 workflow.
+//
+// If there is nothing to show, it returns safe empty values and message_type
+// = "none" so the workflow can skip the send instead of emailing a blank.
+//
+// ----------------------------------------------------------------------------
+// SETUP IN THE WORKFLOW
+//   Secret:  EAP_SERVICE_KEY_TOKEN  (dedicated service key, NOT the shared AO token)
+//     Scopes: crm.objects.contacts.read, crm.objects.companies.read,
+//             crm.objects.custom.read (covers the Divisions object + associations)
+//   Input fields:  contact_id             <-  Contact property "Record ID" (hs_object_id)
+//                  contact_email_language <-  Contact property hubspot_email_language
+//                  contact_registration_status <-  Contact property
+//                                          c2fo_user_registration_status__c
+//                                          ("2" = registered -> button opens the app login;
+//                                           anything else -> buyer microsite)
+//   Languages: English, Spanish, French, German, Italian, Portuguese, Simplified
+//   Chinese (same set as the Invoice Alert email). Drives table headers, the
+//   "Did you know..." block, and number/date/currency formatting.
+//   Output fields (all type STRING) -- add these names exactly in the action:
+//     message_type, company_name, associated_buyer_count, missing_buyer_count,
+//     associated_invoice_count, associated_buyers_table, missing_buyers_block,
+//     missing_buyers_text, expand_network_url, subject_line, headline_text,
+//     intro_text, closing_text, footnote_text, button_label,
+//     top_buyer_permalink, top_buyer_name, top_buyer_microsite_url,
+//     button_url   (NEW: 19 total; the email button uses this, see below)
+//
+// ----------------------------------------------------------------------------
+// OPEN DECISIONS (settings below, no rebuild needed to change them)
+//   MIXED_BUYER_MODE   - what to do when a buyer has some Divisions the contact
+//                        is tied to and some it isn't. See comment on the setting.
+//   EXCLUDED_BUYER_UUIDS - buyers to suppress. Fill from the buyer review
+//                        workbook (rows marked Suppress = Y). Empty = none.
+// ============================================================================
+
+const hubspot = require('@hubspot/api-client');
+
+// ----- HubSpot object / association IDs -------------------------------------
+const DIVISION_TYPE = '2-64087892';        // Divisions custom object
+const CONTACT_TO_DIVISION_ASSOC = 276;     // Contact -> Division (USER_DEFINED)
+const COMPANY_TO_DIVISION_ASSOC = 358;     // Company -> Division (USER_DEFINED)
+
+// ----- Settings ---------------------------------------------------------------
+// 'own_divisions_only'     : a buyer with mixed Divisions counts as ASSOCIATED and
+//                            its totals include only the contact's own Divisions.
+// 'all_company_divisions'  : same, but totals include every eligible Division the
+//                            Company has for that buyer.
+const MIXED_BUYER_MODE = 'own_divisions_only';
+
+const EXCLUDED_BUYER_UUIDS = new Set([
+  // 'paste-buyer-division-uuid-here',   (permanent code-level overrides only)
+]);
+
+// ALLOWED_BUYER_UUIDS: strict allowlist. A Division is only used in an email when its
+// buyer_division_uuid is in this set. Source: HubSpot list 146 ("Supplier | Contact |
+// Buyer Segments | Active Buyer Division UUIDs"), its UUID filter as read 2026-11-11
+// (283 buyers, lowercased). Refresh when list 146 changes.
+const ALLOWED_BUYER_UUIDS = new Set([
+  '0180f0f0-4608-4849-a009-6ae55a467d27',
+  '01ea2f1a-e4f5-4808-8292-a7bb3eac1a81',
+  '02a41ec5-39cd-4ef5-aafd-2d7ad281757f',
+  '03bdddd1-c4a5-4b3b-a8ed-7d6e9b6e56c1',
+  '0513a7d2-24d1-4288-97a3-fd9a8c762df8',
+  '0811b699-4c5e-4902-a67f-5a836e0ca1cb',
+  '085aae1e-21c5-4472-b2f5-f94ccd384744',
+  '08a84e0d-f350-4b2e-82fd-3c82219e50f2',
+  '0b7a0ea4-7a89-45a6-9f1e-c9f1d1f2b4e5',
+  '0d6df33e-e235-4121-8af7-f83a0003ef01',
+  '0e07fa05-b685-4a9b-833d-667490a9fed9',
+  '0f3ac6fe-0b39-498e-aea0-51a3afd0760d',
+  '114ed968-cba9-4aa1-9ea6-595235173e73',
+  '1159b9c2-5f3a-4a3e-9192-7b3e9bc07489',
+  '124cbcd0-1f3c-4b82-b36c-c44cdd06731c',
+  '132dce03-9f07-4119-93d8-b6ac39d5ae64',
+  '1465de71-5507-4dc6-9338-a2913739e3e4',
+  '149b7d7a-03a0-4428-a41c-5427fa712ddc',
+  '15a965e0-d2f5-481c-b9b1-4be27029dbcf',
+  '170e736c-5ad3-4437-ad4d-bd40bef44945',
+  '180477b6-9d60-40d4-9e79-ae5c3d96005a',
+  '18443a21-901e-4256-b3aa-189ca525682f',
+  '1862e7e6-97cf-4bb3-8bd5-3f6977ff93b6',
+  '188d1659-b357-407f-ac5e-5a354799975c',
+  '18be4761-1943-4893-8dc2-1ad91f32eeb5',
+  '19e4b41b-3403-46f7-b094-aed0675f4b8f',
+  '1a1d5ac1-917c-4452-a2c6-a657e863bb7b',
+  '1b1e5843-fdae-4b72-b274-baf3bf6dd0e7',
+  '1b4673d5-a2d0-48e1-ba3d-a487256aac0b',
+  '1b5abc19-5aa4-48cf-ab3d-6f761a7423db',
+  '1be54564-40b8-400a-9359-1e4c336780d0',
+  '1c195000-a238-4f2f-8a03-d71698b22bd7',
+  '1dc32ff4-ce64-4e66-8e8f-2646eb35cf6d',
+  '1df81680-1d2d-46a2-b74c-2729bf8f0150',
+  '1ebabcb9-ae90-4392-a05e-5d6e700c866e',
+  '1f3d9b92-c98a-4696-9d8a-c6a3929d07ce',
+  '1f791686-ce14-4717-9225-fb9c9735e78c',
+  '20c6536b-cc91-4879-b49a-5c0c4c414531',
+  '20d12f60-84cf-44cf-b8dc-4e7ecd791796',
+  '22a8e221-3d51-4951-baf2-7b235eca8d1c',
+  '23e26186-e1de-4de4-83fd-753dc6470123',
+  '23e32360-f3b6-4fc3-8e7c-b5ffc668e400',
+  '242efe58-84cc-4c3a-a67e-69908cb49b94',
+  '26d7c304-68f1-427e-ae30-7308d1cc9098',
+  '28bced07-35d4-4da2-916a-67d7b66df190',
+  '2937c29f-1d47-401f-aa94-4f65272e147f',
+  '29a42811-9d3e-4e22-8260-2adae4349120',
+  '29b53da7-fcf6-40d0-9be6-56d30e8d0ad1',
+  '29e4d852-cdd7-4b89-bfd5-ef079c2a106f',
+  '2a812ea3-ad52-4a7e-a107-cd840fc85727',
+  '2c326e20-040d-41d2-a48c-69134fbcd34d',
+  '2eb8dd9d-86b1-455f-a3e5-b424b0518ea9',
+  '2f003bfc-70da-402d-85b8-4a70ad069db5',
+  '2f74e23a-a617-407d-be6c-2175e2b0398c',
+  '2fe6f3d5-6859-48f9-a6e8-7d227fa8734d',
+  '305374fc-b491-4564-97c4-7f2214be01c6',
+  '322041b0-3bc4-4d62-8a1f-0d2c696fc909',
+  '32646df3-d246-4248-9f78-897e8c01e6ea',
+  '344ec1d5-4372-4534-96ef-5a5bbe92c528',
+  '35fb534f-4c23-4a47-a8c2-b686c7a89eb5',
+  '37ec9fe1-2d4e-492e-8070-15be8aa65663',
+  '38a75eb4-4d82-4aa7-b3dd-17bb87903b0b',
+  '3967f47b-feef-41e3-b29d-c4efe189e117',
+  '39d22114-5e68-43b7-877e-00fdeb89ec21',
+  '3a214676-0172-45dc-ad79-a5655b082f2f',
+  '3b07fa8d-4697-44d2-b199-47cc0a31560a',
+  '3b2c4602-66d4-4fa1-8177-42eee4e3e7b9',
+  '3b426726-1589-48f5-9145-837e1c0e51ae',
+  '3c53f1fb-a5fa-4bf8-b564-f5d3982bb307',
+  '3d9777cd-cbe4-4c16-8f00-cbe90a0a2432',
+  '3e1def22-2558-422f-ab2b-f0e40bd22fe6',
+  '3e5c5e40-bf45-42c0-bbdd-ecd813cacf78',
+  '3ee0800a-9af6-4d61-a4f1-5c0a2ec11ff6',
+  '3f98acf9-7912-41fc-9f66-c7b903e5eae3',
+  '3f98d1c6-b6af-47cd-b7e6-ec12ea7e4651',
+  '40c3ab8f-383c-4c5a-bb02-a6bdc5061aee',
+  '428f9f5c-ccea-4ce7-9cc6-89dd66cd5a45',
+  '43e0fc2b-5b3c-4c0a-b91c-c974c0b125d3',
+  '44ef82e8-be54-40c3-b8a4-052e2abcc776',
+  '458707f2-7f63-4aaf-8511-baba8cd99a6e',
+  '45b37969-32c3-426f-91f1-8afed397a2c1',
+  '45eb1be0-ab28-422d-9ab4-0db0c2814ca7',
+  '466690e2-adee-445d-92a0-b3d2a2f56c8a',
+  '4842e5e5-7ce8-4675-b6c0-ebfb8b27e7b8',
+  '49932c8c-43e5-4339-bfaf-95bbdb0c5374',
+  '4a3c3adb-b9b7-4c29-8e2d-51285bbf9980',
+  '4dbaff7a-53d5-4a7f-a4c2-f6f8cc92e70c',
+  '4dc0bbe0-211d-4f21-8c6b-972727074256',
+  '4ddd2cdb-25de-4975-9873-3d668d5a6560',
+  '4e371bb4-93b7-414a-9af6-d897d56b276b',
+  '4e448c64-38ac-4a42-a223-fcf2143b696a',
+  '4e768b65-3602-4f37-a619-41866902415b',
+  '4efd08ca-4e5a-4399-ac75-fd8b4e548e33',
+  '4f3c736c-2588-48ac-802b-afd0492c5bd9',
+  '4f53aaf3-9e99-4651-9d71-6939bc918cc0',
+  '4fc3e58a-fad0-445a-94e5-c68e2596c1b1',
+  '50719433-a3aa-419c-ba88-6ac7b7334027',
+  '533ac3b4-1fc7-4111-b27b-4fa82d995d58',
+  '537c9c0b-0fd9-43b2-948a-e371d62a91d2',
+  '53db192d-9ce3-4449-a10c-f31b626f7162',
+  '53e0fac5-2f28-4087-b593-094a4befa1c3',
+  '575eff9c-3871-4dc5-8291-81393bed347d',
+  '57e5a3e2-89f1-4323-b696-e747a288c6da',
+  '59d90094-ab2f-4ea2-b81b-a7df01246077',
+  '5a029d63-b10e-4c3f-ba86-130861c3e8d0',
+  '5b84111a-c739-47c6-bdd5-c9b5f420f811',
+  '5bec13a1-5114-4d37-b627-0d835aa5035c',
+  '5c23c28b-8619-48d8-af72-3c54156225e6',
+  '5d62eeeb-4cd4-4a1c-abce-072c5b3855da',
+  '5fafdde2-8260-417b-8559-6185102bd2c5',
+  '5fe45340-250f-4f2e-812c-7127035060b9',
+  '62153a75-e5b8-4d11-9ebb-69ce88d64d0f',
+  '629a8019-8dfb-4a52-b58e-8fc34e5d4191',
+  '62d8507b-e7d6-4bf3-97ba-9ffd1d6b5c5f',
+  '62da231e-69b4-4ed2-a97d-965ac0d0ba34',
+  '64c79100-a66e-4804-804f-27e59ff7302d',
+  '6514223c-e85e-4317-acfa-4cc17fd83177',
+  '65574ca9-a744-40ae-a642-285cf9c554a8',
+  '65d2470e-83cd-43ca-a616-faef9580a701',
+  '67fdf23d-1d0a-46f4-84bf-8fb44e3f9565',
+  '682377c2-4120-459e-9be0-0658aec48065',
+  '683fd3d7-1d17-4e1b-b36c-5461cba881a9',
+  '69e792bb-9f57-4043-ad06-631c43b017b6',
+  '6a5533e2-2ee6-4128-be11-7b99fd129476',
+  '6bec96f0-ea87-4265-9919-c08930bc8244',
+  '6c66df47-47cf-4c31-8d22-6fbbedc10562',
+  '6c7c4203-0448-4b62-8828-a49eb649c82f',
+  '6d6c0fc0-cea8-4453-b867-eebff3b02b26',
+  '6d884a6d-d85d-42c6-8156-5f05059ec5c3',
+  '6ddfbc4b-b0cf-4c96-a6e1-308ee531179e',
+  '6efe722a-d74a-4cd9-92a9-b6c981202a62',
+  '6f50e3c6-7d10-4dde-a6f6-bf811c30f154',
+  '6fea7767-16ea-4bdd-b7a7-0ae43ba372fb',
+  '72dc4806-3c53-42ba-a7d2-1e692d708e50',
+  '73bd07cf-c168-40c6-bf87-3f4211aaaf1f',
+  '747557f0-4993-4ef4-9297-6af7467d9cd3',
+  '75abf8a6-f7cd-43cb-a436-8d6757bf555d',
+  '75db217f-ee0a-49ba-b723-0ba1b33dd65e',
+  '760236d5-8ce7-415b-9c00-664724e71757',
+  '76882cf1-3e9c-42fb-8829-17312ab8b1d2',
+  '76fe69e1-6cec-4a1e-b143-1a6bc72bc891',
+  '7824230f-6fb1-4e41-8879-8268e498e5e6',
+  '79488cce-e6be-4604-9a03-8bc44fd916aa',
+  '79c7d6df-067c-43a7-a57b-8867bd5b15e2',
+  '7b5e0c6b-d3d1-45d0-9b7c-9d5409227759',
+  '7c5945f1-91ba-45b8-96ef-5fc79328023c',
+  '7cd1d93d-9aba-445e-8979-73e2c7642e25',
+  '7dd6cfe7-3041-4695-b93b-f3ddd81f80f3',
+  '7dec2ee1-38cd-4bc0-b5b5-25f882f8f4d3',
+  '7e8b02cd-b125-43f8-9653-dcfc888f0d55',
+  '7f7e8fd1-aba1-4f82-949a-3e7f0ac8e45f',
+  '806824dd-2232-443d-b8d5-15c063b85c66',
+  '80763278-0cf8-45cc-9149-db7b81b9e5f8',
+  '819b77d9-9ab6-40f3-96da-62bca31b4e3b',
+  '81b3c48f-6ec7-45c3-9460-dfbe3c010d42',
+  '831f5012-0e40-4913-95bb-503d50a1794b',
+  '83c46f5b-9225-4da3-b719-451d0ecbd4de',
+  '84159c04-e774-46da-b073-a836639e7e65',
+  '843494f6-916d-4abb-900e-5f3a36ab7cf7',
+  '84cb160e-5f7b-447f-8b4e-68f7d60b91c0',
+  '8539d830-1f0c-408e-9dbb-e79d9019e1ae',
+  '87f905a6-1d88-457f-90a6-c4e03fef34b1',
+  '88ea8862-32f0-4ebc-a7c0-e4c715f3320a',
+  '8a1b67a3-8704-4636-858a-d80aa9ac73df',
+  '8ab1b70c-5caa-46df-866a-cafba76f17b8',
+  '8bba945b-5913-4e60-8afa-3a1ee5f525e8',
+  '8c036d69-a428-4be9-a71e-bb3b72bbdd6c',
+  '8c2d2494-5c2b-46b9-bf19-6ac585b4f07c',
+  '8d421b3c-05bb-4b68-a239-816eca6054bf',
+  '8d88b218-d2e8-4032-92cf-2b2f3bb26541',
+  '8e20f951-39cd-40c5-86c6-d797a025ee34',
+  '90176354-5bdd-489d-9e13-aed9e4c896af',
+  '929db81e-4fd8-4730-b744-832afcacfe90',
+  '92fc8b82-3920-4ad6-899e-7107b7fffec3',
+  '94f0855d-63f7-44a2-8d0c-a92cb78b513f',
+  '95d30e6f-4749-4879-9437-6202ae706ee7',
+  '96e41116-65b7-4cfb-824f-d189e8f387a6',
+  '98c1b74f-aa38-44b7-93ce-41717fb9d6a0',
+  '9944b9f1-0015-4a0f-b454-f72339782a46',
+  '9971cafd-2c7b-44b5-b6fe-1e478fae832e',
+  '9a9cc67e-fc54-47a4-a678-7259dbd54dbe',
+  '9d74ffa8-e9f2-4422-9dbf-a260e6580c42',
+  '9e1a2e52-0a09-41c2-a439-7122a5af76da',
+  '9ea4d396-ec20-403b-8d25-42d8cf05ac10',
+  'a08ae25e-11a8-456c-843f-f19a64fb4611',
+  'a1af9eae-2bc1-466b-9cd0-540b721aa0b7',
+  'a341fcf6-7ccc-4616-84bd-af5972fec02a',
+  'a3a54c84-be09-4ae1-a0e8-fce07a161d06',
+  'a545dece-4ea4-40c6-8416-8dee79b00f28',
+  'a6afcffd-c474-492e-b944-9e89e7b433b9',
+  'a6ece41c-8259-4c08-8364-188663072298',
+  'a8c92e09-3b64-44d7-8c62-2f9b38e42f2e',
+  'a9c99ffa-b714-43e4-a076-c4bf444b1fe4',
+  'aa4a8e3e-1e27-4bea-a6df-7ff79f1f017b',
+  'ab241bb5-29e5-4262-bf38-4bc4499f23be',
+  'ab7c5f05-a2f1-4858-a578-fb8bdbc68779',
+  'abf59032-4c98-4626-916a-6e2b70d4d8a8',
+  'ad50dd2e-30f1-43b8-b7ef-6006b600570b',
+  'aec65e43-8d9b-480b-accb-b3777ec25f92',
+  'b04e2452-55e5-4d88-ba00-83a95cc6ae30',
+  'b05c599c-53df-4015-8250-0920b63221b0',
+  'b1398d90-8d17-44b8-bbf9-f9b1e1328df0',
+  'b2bbf670-2a7c-4c00-8323-ecbc8a37849b',
+  'b47f8232-124b-41d4-aaa9-7e24c9355159',
+  'b5c4eaec-499f-43fe-93bb-c2924f009fb4',
+  'b7c6e148-d380-4c75-89cc-6869dcf2027f',
+  'b8293caf-4522-45ce-b24d-b77df0983eb6',
+  'b8473073-4818-4fbf-b019-98d01f1ce941',
+  'bb27feff-d905-4c3f-a59d-dc4877d10e79',
+  'bdb4e75f-d8dd-403b-88d5-4b69d9168a77',
+  'bfb0a43c-3a1c-434b-8b7e-aa2db2f25fdc',
+  'c077d530-df74-4901-9a18-094e1499f740',
+  'c0b92b93-15e8-4879-950f-62add73f10f9',
+  'c1070a0a-523b-4b1e-8483-d8f57b334347',
+  'c1811190-f700-41ee-bd7c-fed1e870ffe9',
+  'c1ac9c25-c34c-4a7f-8a67-a07d7ecff293',
+  'c2478e37-74e9-44f5-97c9-d75be1d0abcd',
+  'c2ac9633-bc0c-47a4-a257-375f9430cec0',
+  'c2e5a4e1-9b9b-47e4-b428-a49ddb36ba12',
+  'c32ca6c4-e0ef-48b4-a602-55010ebbd529',
+  'c37d446c-4666-4de5-bead-c540d3756868',
+  'c3f3cac5-2743-4c13-b4b9-bcfed991e3ad',
+  'c541ab92-ffa2-4a07-9d76-ffcb1b2cbbcc',
+  'c567aae5-4de4-4018-a7c4-cdbc3e438e2a',
+  'c5af1b76-67ad-4909-83f9-a70951b9e6ba',
+  'c75e9bcc-441d-4111-857d-0aa07e306c19',
+  'c791d982-4124-4d10-ba2f-6bcb38568ed6',
+  'c8552423-ff8e-4755-a376-018ea43cf2db',
+  'c9073b59-8d1e-4fcb-a8d3-e989821ac8b6',
+  'cb536f41-e7dc-4345-aa8b-e16507b1b328',
+  'cb5e311d-ea9c-46d1-8347-018aa641c000',
+  'ccabcd73-90cb-457a-9784-7e108a21f2c1',
+  'ccdd5e88-b27e-47e7-9c25-db27dcc73b92',
+  'ceee6639-6280-44d6-b9f5-d76c4fea15b3',
+  'cf29319b-e9f3-40ed-af43-6fb458ddf7db',
+  'cf7fa4c1-4dc2-4ede-86a7-51a7ea7a0d2a',
+  'd01c7949-450c-400b-98fc-fb52119c80b8',
+  'd08099a3-c011-46e6-b066-ab6876344a59',
+  'd09195a8-7719-493a-a49b-d54dffefedd8',
+  'd0ee0a0f-2a66-4c28-89f4-e194473b71d1',
+  'd200d069-5748-4058-aeb7-b2738ba58f1c',
+  'd212968a-94c3-42a1-8ff2-494f5b3bebff',
+  'd2c31f36-e669-40e0-899e-37e4465a6b7b',
+  'd610a0fa-e250-4eea-a714-26d1f3df6666',
+  'd8223aa1-e2c1-47f6-a925-27fae8ba288e',
+  'd82cbb47-df66-4f06-8676-3cb00939442a',
+  'd9b31ba3-9b3c-4ec0-957d-bcc3dfeb0795',
+  'da82faee-b27d-48d0-8cef-bdf438b51b78',
+  'ddb537ca-e051-4c83-b38d-f6301176b0bd',
+  'de1b521b-a9e5-4fc4-b42b-9562affa86f9',
+  'de30f515-e966-467a-8d3f-245c90e71696',
+  'de4d7f12-aade-482f-89b3-97a62c205175',
+  'de7d9904-6c4c-4d38-b3dc-012bb95d4880',
+  'de9b8e28-36b8-47d9-bad7-ecc5632d793c',
+  'df08bc35-4f93-4ed7-a352-ac54e89c32c0',
+  'df15194b-6897-4c23-89ef-bfaf7c577f81',
+  'dfbe595f-d003-4b9d-9c82-eaa8416bce47',
+  'e18e9815-7280-403f-a5a2-7f8f991659b3',
+  'e1d86aca-29f7-403e-b0c5-06a5a6db4120',
+  'e37d5840-d5ef-499a-8979-3589b5a68a1f',
+  'e5be9604-455f-4c35-8351-a168d4fd2f7f',
+  'e5fa1e91-47e1-483d-908c-0a9b8224a3d6',
+  'e892d956-a140-4aae-a47d-68d5b4956eb9',
+  'ea447882-2435-4c66-b4f2-9a272510eed9',
+  'ea908a43-68f6-44c4-94c5-2eeb8c903eaa',
+  'eae92cb6-8c03-480a-8ccb-631141e7eb51',
+  'eb4e4f76-b8a2-4dd7-a9f4-b7f78e2463f0',
+  'ed2d9b42-f109-48ef-a032-6d3346c9b01a',
+  'ef1a8d71-cccc-430a-8932-e56cca70e60d',
+  'ef441eda-8549-44ea-b151-e234cf058ca9',
+  'f066ebc1-e2ec-46ce-a83c-0a3f2ea487e3',
+  'f0ffb21d-368d-44d1-abf1-27990dcece8c',
+  'f15362ac-4ef3-4a86-8c5b-b12ca649f662',
+  'f1a3cbfa-dd8c-48bb-bd98-d3d2cd97713c',
+  'f292f537-e7ee-49a7-9938-34ef9852b9ae',
+  'f3e8aad8-8eff-4a10-8e41-45aecc7cdec3',
+  'f643dae0-ea2d-4318-bf63-4fcfb575a8b8',
+  'f6efa4e4-8f3f-461c-bfd4-2c34a1c72fd0',
+  'fc16eee2-be61-45bc-8188-a3d44a1cc4cb',
+  'fd33ccfd-0564-4be8-aad9-bc3da1cc3dcb',
+  'fdd611cb-51d4-4e22-b3b9-991a4f246b8b',
+  'fedc7371-c7a2-4af0-8170-a0226237e262',
+  'ffcf76ee-382c-4d2b-b447-047ff3ab53ea',
+]);
+
+// Pauses on top of the allowlist ("on, but stop marketing to this market for now") can be
+// controlled in HubSpot, not in this code:
+// Buyers to suppress are controlled in HubSpot, not in this code: the published
+// HubDB table below. Each row = one buyer (column buyer_uuid = the Division's
+// buyer_division_uuid). A buyer is suppressed while its row has active = true and
+// resume_on is empty or in the future. No row = buyer is on. Needs the "hubdb"
+// read scope on the EAP_SERVICE_KEY_TOKEN key. If the table cannot be read, the
+// step FAILS (no email) rather than risk emailing a suppressed buyer.
+const SUPPRESSION_TABLE = 'eap_buyer_suppression';
+// Switched OFF until the HubDB table exists and the key has the hubdb read scope.
+// When false, no HubDB call is made. Set to true to start honouring pauses.
+const PAUSE_TABLE_ENABLED = false;
+let SUPPRESSED_BUYERS = new Set();
+
+// BUYER_PERMALINKS: buyer_division_uuid -> C2FO microsite permalink (from Redshift
+// marketing_makers_divisions, Salesforce as fallback). Lines marked REVIEW were
+// ambiguous in the source data. Refresh when new buyers are added.
+const BUYER_PERMALINKS = {
+  '00094017-a5bd-4bc6-99fd-05799693abcf': 'hindalco',
+  '012ab2ba-a16e-4436-ab43-c9aaf6f2cb94': 'chevron',
+  '0180f0f0-4608-4849-a009-6ae55a467d27': 'mahindracie',
+  '01a74f5b-9e9a-4277-b83c-cc1bdc72fcef': 'jvl',
+  '01ea2f1a-e4f5-4808-8292-a7bb3eac1a81': 'currys',
+  '02a41ec5-39cd-4ef5-aafd-2d7ad281757f': 'haier',
+  '0376eae6-e78f-4362-b228-e8e3d43d4117': 'perfetti',
+  '03bdddd1-c4a5-4b3b-a8ed-7d6e9b6e56c1': 'riteaid',
+  '0513a7d2-24d1-4288-97a3-fd9a8c762df8': 'cumi',
+  '05224457-95f4-4fb9-a6d9-18e13ce7dab8': 'nomadfoods',
+  '05534ee0-ef2b-4b3c-a63b-c3e9c1d1310b': 'lowes',
+  '0613757b-6d6d-46e6-ad52-6faa0d8431e3': 'rh',
+  '07cf9c69-9ac8-47c3-96a0-e4f44aa7e8d8': 'mediamarktsaturn',
+  '0811b699-4c5e-4902-a67f-5a836e0ca1cb': 'mta',
+  '084c4e52-0397-4ba1-9b8a-4620fe907837': 'cass',
+  '085aae1e-21c5-4472-b2f5-f94ccd384744': 'acehardware',
+  '08a84e0d-f350-4b2e-82fd-3c82219e50f2': 'birlaopus',
+  '090e4ae3-c8d2-49a3-84a6-819abc4562f3': 'jfl',
+  '0985dca1-dab0-40b3-bae8-84c9d964f319': 'rkworldinfocom',
+  '09909b83-0058-4f53-9272-bd604fbe13c8': 'maersk',
+  '0b7a0ea4-7a89-45a6-9f1e-c9f1d1f2b4e5': 'tubeinvestments',
+  '0d6df33e-e235-4121-8af7-f83a0003ef01': 'flex',
+  '0e07fa05-b685-4a9b-833d-667490a9fed9': 'zyduslifesciences',
+  '0e534e65-1f28-4e39-9d28-4a9ec5ca69dc': 'mothercare',
+  '0f23484d-40eb-47d5-aaad-8f1de68176e6': 'siemens',
+  '0f3ac6fe-0b39-498e-aea0-51a3afd0760d': 'walmart',
+  '0f84f960-f0bf-412e-9f18-cefac6c40382': 'lyreco',
+  '0f9f6b96-4377-4c26-b009-d50d5eee5724': 'itcgroup',
+  '0fdb762a-9b3b-4fbb-9fea-8a4e7c1cb21b': 'pfizer',
+  '11039846-065d-434b-a0f9-b7f27f4fb2ee': 'siemensenergy',
+  '114ed968-cba9-4aa1-9ea6-595235173e73': 'experian',
+  '1159b9c2-5f3a-4a3e-9192-7b3e9bc07489': 'dabur',
+  '124cbcd0-1f3c-4b82-b36c-c44cdd06731c': 'costco',
+  '132dce03-9f07-4119-93d8-b6ac39d5ae64': 'univar',
+  '1465de71-5507-4dc6-9338-a2913739e3e4': 'bjs',
+  '149b7d7a-03a0-4428-a41c-5427fa712ddc': 'mondelez',
+  '15a965e0-d2f5-481c-b9b1-4be27029dbcf': 'rei',
+  '15fd0651-785c-441d-bcb2-0787e35d8b4b': 'tvssrichakra',
+  '170e736c-5ad3-4437-ad4d-bd40bef44945': 'united',
+  '17b327b6-ac5a-4f45-b63a-fc7c9c1f5d39': 'aperam',
+  '180477b6-9d60-40d4-9e79-ae5c3d96005a': 'deutschebank',
+  '18443a21-901e-4256-b3aa-189ca525682f': 'amazon',
+  '1862e7e6-97cf-4bb3-8bd5-3f6977ff93b6': 'ceat',
+  '18be4761-1943-4893-8dc2-1ad91f32eeb5': 'herocycles',
+  '19d2e7b9-1855-44e4-b914-0f63355d2bb7': 'aragenlifesciences',
+  '19e4b41b-3403-46f7-b094-aed0675f4b8f': 'acer',
+  '1a1d5ac1-917c-4452-a2c6-a657e863bb7b': 'amazon',
+  '1b1e5843-fdae-4b72-b274-baf3bf6dd0e7': 'accobrands',
+  '1b4673d5-a2d0-48e1-ba3d-a487256aac0b': 'itl',
+  '1b5abc19-5aa4-48cf-ab3d-6f761a7423db': 'perfetti',
+  '1be54564-40b8-400a-9359-1e4c336780d0': 'techdata',
+  '1c195000-a238-4f2f-8a03-d71698b22bd7': 'flex',
+  '1c7dfd0f-f2e9-4445-99f1-441f9c8078e3': 'tpk',
+  '1d24924d-d5d7-425e-98ae-ceb898718810': 'ynap',
+  '1dc32ff4-ce64-4e66-8e8f-2646eb35cf6d': 'marico',
+  '1df81680-1d2d-46a2-b74c-2729bf8f0150': 'mankindpharma',
+  '1e107ffd-0b9a-451e-938b-93b57cccaee4': 'garrettmotion',
+  '1ebabcb9-ae90-4392-a05e-5d6e700c866e': 'urbanoutfitters',
+  '1f3d9b92-c98a-4696-9d8a-c6a3929d07ce': 'gianteagle',
+  '1f791686-ce14-4717-9225-fb9c9735e78c': 'tco',
+  '1ffdde72-c585-4f7a-b2b5-a3693345e29d': 'bergerpaints',
+  '20c6536b-cc91-4879-b49a-5c0c4c414531': 'nyp',
+  '20d12f60-84cf-44cf-b8dc-4e7ecd791796': 'cspc',
+  '214c3319-766f-46c3-bbc3-734254a11a46': 'logitech',
+  '22a8e221-3d51-4951-baf2-7b235eca8d1c': 'sify',
+  '23e26186-e1de-4de4-83fd-753dc6470123': 'hikal',
+  '23e32360-f3b6-4fc3-8e7c-b5ffc668e400': 'exxonmobil',
+  '242efe58-84cc-4c3a-a67e-69908cb49b94': 'norfolksouthern',
+  '269613bf-2131-4d63-9b58-eaf494a0018e': 'ford',
+  '26d7c304-68f1-427e-ae30-7308d1cc9098': 'philips',
+  '28bced07-35d4-4da2-916a-67d7b66df190': 'petsmart',
+  '2937c29f-1d47-401f-aa94-4f65272e147f': 'apollo',
+  '29a42811-9d3e-4e22-8260-2adae4349120': 'jswsteelcoated',
+  '29b53da7-fcf6-40d0-9be6-56d30e8d0ad1': 'itt',
+  '29e4d852-cdd7-4b89-bfd5-ef079c2a106f': 'clariant',
+  '2a812ea3-ad52-4a7e-a107-cd840fc85727': 'vguard',
+  '2b4ff957-257d-483e-a698-6c292e9d69f8': 'doosanbobcat',
+  '2c326e20-040d-41d2-a48c-69134fbcd34d': 'reliancedigital',
+  '2d30efa9-e39e-4ddb-871b-5471c90c273f': 'chevron',
+  '2e3c006a-c41b-4d91-88ba-53244e1b131a': 'medtronic',
+  '2eb8dd9d-86b1-455f-a3e5-b424b0518ea9': 'doitbest',
+  '2f003bfc-70da-402d-85b8-4a70ad069db5': 'citgo',
+  '2f74e23a-a617-407d-be6c-2175e2b0398c': 'deutschebank',
+  '2f9fce4b-044b-4afc-949f-a7acaa87da7b': 'danoneindia',
+  '2fe6f3d5-6859-48f9-a6e8-7d227fa8734d': 'ambuja',
+  '305374fc-b491-4564-97c4-7f2214be01c6': 'escortskubota',
+  '31e63fca-0524-4ba3-b851-f6212a2d38f8': 'westmill',
+  '322041b0-3bc4-4d62-8a1f-0d2c696fc909': 'up',
+  '32646df3-d246-4248-9f78-897e8c01e6ea': 'cummins',
+  '3316cf72-d412-47f9-8ba8-b48b219f2a77': 'dillards',
+  '333cf4d9-bee1-45aa-93f3-71598b729728': 'philipsda',
+  '344ec1d5-4372-4534-96ef-5a5bbe92c528': 'turboenergy',
+  '35fb534f-4c23-4a47-a8c2-b686c7a89eb5': 'acer',
+  '37ec9fe1-2d4e-492e-8070-15be8aa65663': 'meijer',
+  '38a75eb4-4d82-4aa7-b3dd-17bb87903b0b': 'quad',
+  '3967f47b-feef-41e3-b29d-c4efe189e117': 'tatapower',
+  '39d22114-5e68-43b7-877e-00fdeb89ec21': 'bt',
+  '3a214676-0172-45dc-ad79-a5655b082f2f': 'walmart',
+  '3a4fd102-3a03-453b-a6ba-e3b7701a5905': 'citiprocure',
+  '3ae7aea4-b3ce-4a0b-8625-00472824c6c6': 'godrej',
+  '3b07fa8d-4697-44d2-b199-47cc0a31560a': 'synthite',
+  '3b2c4602-66d4-4fa1-8177-42eee4e3e7b9': 'philips',
+  '3b426726-1589-48f5-9145-837e1c0e51ae': 'savemart',
+  '3c0ab51a-858c-4a3d-80a9-7edfb62401d7': 'rivian',
+  '3c53f1fb-a5fa-4bf8-b564-f5d3982bb307': 'mpc',
+  '3d9777cd-cbe4-4c16-8f00-cbe90a0a2432': 'lifestyle',
+  '3e1def22-2558-422f-ab2b-f0e40bd22fe6': 'bungeindia',
+  '3e5c5e40-bf45-42c0-bbdd-ecd813cacf78': 'yazaki',
+  '3ee0800a-9af6-4d61-a4f1-5c0a2ec11ff6': 'travisperkins',
+  '3f98acf9-7912-41fc-9f66-c7b903e5eae3': 'philips',
+  '3f98d1c6-b6af-47cd-b7e6-ec12ea7e4651': 'adeo',
+  '40c3ab8f-383c-4c5a-bb02-a6bdc5061aee': 'agco',
+  '428f9f5c-ccea-4ce7-9cc6-89dd66cd5a45': 'airfrance',
+  '43c0ca62-ea5e-4ba6-aaa6-eb41464fe757': 'nxp',
+  '43e0fc2b-5b3c-4c0a-b91c-c974c0b125d3': 'cummins',
+  '43e90a9e-557a-4d65-aa47-0a6d462dde61': 'grasimchemicals',
+  '44ef82e8-be54-40c3-b8a4-052e2abcc776': 'tjx',
+  '458707f2-7f63-4aaf-8511-baba8cd99a6e': 'ashirvad',
+  '45b37969-32c3-426f-91f1-8afed397a2c1': 'mohawk',
+  '45eb1be0-ab28-422d-9ab4-0db0c2814ca7': 'helzberg',
+  '46535514-60b4-4e75-bc5a-242e95868b37': 'metso',
+  '466690e2-adee-445d-92a0-b3d2a2f56c8a': 'mclane',
+  '4842e5e5-7ce8-4675-b6c0-ebfb8b27e7b8': 'tjx',
+  '49932c8c-43e5-4339-bfaf-95bbdb0c5374': 'unominda',
+  '4a3c3adb-b9b7-4c29-8e2d-51285bbf9980': 'bnsf',
+  '4a6bee2e-bade-4365-91ee-694431117c2a': 'moog',
+  '4dbaff7a-53d5-4a7f-a4c2-f6f8cc92e70c': 'accobrands',
+  '4dc0bbe0-211d-4f21-8c6b-972727074256': 'reliancefnl',
+  '4ddd2cdb-25de-4975-9873-3d668d5a6560': 'nvcl',
+  '4e371bb4-93b7-414a-9af6-d897d56b276b': 'flex',
+  '4e448c64-38ac-4a42-a223-fcf2143b696a': 'officedepot',
+  '4e768b65-3602-4f37-a619-41866902415b': 'sodexo',
+  '4efd08ca-4e5a-4399-ac75-fd8b4e548e33': 'cvshealth',
+  '4f3c736c-2588-48ac-802b-afd0492c5bd9': 'dalmiabharatgroup',
+  '4f53aaf3-9e99-4651-9d71-6939bc918cc0': 'tweglobal',
+  '4fc3e58a-fad0-445a-94e5-c68e2596c1b1': 'albertsons',
+  '50719433-a3aa-419c-ba88-6ac7b7334027': 'praj',
+  '509c374c-30d7-4466-8aee-e35ab9e70693': 'jumbo',
+  '537c9c0b-0fd9-43b2-948a-e371d62a91d2': 'walmart',
+  '53db192d-9ce3-4449-a10c-f31b626f7162': 'flex',
+  '53e0fac5-2f28-4087-b593-094a4befa1c3': 'staples',
+  '5490673e-8dbe-4bd3-88f8-72d7da81ca08': 'unfi',
+  '54d5d2b9-5ddd-4bfa-8685-2e333e520752': 'paramountglobal',
+  '574f846d-1427-49eb-9a07-3426549b3db8': 'mediamarktsaturn',
+  '575617e8-4c8c-495a-8dac-16b7a19d99a3': 'borealis',
+  '575eff9c-3871-4dc5-8291-81393bed347d': 'amazon',
+  '57e5a3e2-89f1-4323-b696-e747a288c6da': 'ultratech',
+  '58bfb9fb-f29e-4cbe-bf58-d1eba08ecd1e': 'toysrus',
+  '59d90094-ab2f-4ea2-b81b-a7df01246077': 'tatametaliks',
+  '59edb662-b806-4042-b164-7cc8e47fe7a1': 'gavl',
+  '5a029d63-b10e-4c3f-ba86-130861c3e8d0': 'zydus',
+  '5b84111a-c739-47c6-bdd5-c9b5f420f811': 'bestbuy',
+  '5bec13a1-5114-4d37-b627-0d835aa5035c': 'fincantieri',
+  '5c23c28b-8619-48d8-af72-3c54156225e6': 'sudchemie',
+  '5cb97f76-4540-42c9-89a5-e11681814efe': 'lyreco',
+  '5d62eeeb-4cd4-4a1c-abce-072c5b3855da': 'cipla',
+  '5ddf7857-06ce-4637-b5a7-91d0646ea81d': 'unileverng',
+  '5fafdde2-8260-417b-8559-6185102bd2c5': 'deutschebank',
+  '5fe45340-250f-4f2e-812c-7127035060b9': 'bandq',
+  '62153a75-e5b8-4d11-9ebb-69ce88d64d0f': 'medtronic',
+  '629a8019-8dfb-4a52-b58e-8fc34e5d4191': 'britannia',
+  '62d8507b-e7d6-4bf3-97ba-9ffd1d6b5c5f': 'medtronic',
+  '62da231e-69b4-4ed2-a97d-965ac0d0ba34': 'eidparry',
+  '63e6bf04-f786-4b0e-83b4-576a38ac9e38': 'lyreco',
+  '64c79100-a66e-4804-804f-27e59ff7302d': 'walmart',
+  '6514223c-e85e-4317-acfa-4cc17fd83177': 'stmicro',
+  '6521cb49-d89c-4424-b3e5-9b0d33380bef': 'lyreco',
+  '65574ca9-a744-40ae-a642-285cf9c554a8': 'loblaw',
+  '65d2470e-83cd-43ca-a616-faef9580a701': 'thermofisher',  // REVIEW
+  '67fdf23d-1d0a-46f4-84bf-8fb44e3f9565': 'sunpharma',
+  '682377c2-4120-459e-9be0-0658aec48065': 'elevancehealth',
+  '683fd3d7-1d17-4e1b-b36c-5461cba881a9': 'orange',
+  '698ea5f4-106d-4d49-8a63-922afc70341b': 'rcpl',
+  '69d65392-a485-42d6-bdcd-a803e4c12753': 'lyreco',
+  '69e792bb-9f57-4043-ad06-631c43b017b6': 'gcpl',
+  '6a4d7569-8cc4-466d-861c-4852b4fffdf8': 'dow',
+  '6a5533e2-2ee6-4128-be11-7b99fd129476': 'campbells',
+  '6a57be28-9676-4783-96ba-e5bb7ed6f248': 'itcgroup',
+  '6bec96f0-ea87-4265-9919-c08930bc8244': 'amazon',
+  '6c66df47-47cf-4c31-8d22-6fbbedc10562': 'raychemrpg',
+  '6c7c4203-0448-4b62-8828-a49eb649c82f': 'dpworldcaucedo',
+  '6cae03b9-7515-40dc-9d70-afe3326ef4bc': 'morrisons',
+  '6d884a6d-d85d-42c6-8156-5f05059ec5c3': 'gerdau',
+  '6ddfbc4b-b0cf-4c96-a6e1-308ee531179e': 'leonicable',
+  '6e1b63e7-6cef-41c0-9970-898f625e08d0': 'sonablw',
+  '6ea6d749-3a79-4443-b247-42a129e752e9': 'dufil',
+  '6efe722a-d74a-4cd9-92a9-b6c981202a62': 'metrocashandcarry',
+  '6f50e3c6-7d10-4dde-a6f6-bf811c30f154': 'comfortdelgro',
+  '6fea7767-16ea-4bdd-b7a7-0ae43ba372fb': 'kec',
+  '7033a218-78fd-4a56-8c76-058390d6da47': 'payless',
+  '72dc4806-3c53-42ba-a7d2-1e692d708e50': 'capitalfoods',
+  '73bd07cf-c168-40c6-bf87-3f4211aaaf1f': 'bt',
+  '7460a75e-7358-449c-8775-b3933f7fc6df': 'mtn',
+  '746a6564-b018-4faa-a0d7-5fb9abb05139': 'wabtec',
+  '747557f0-4993-4ef4-9297-6af7467d9cd3': 'hbfuller',
+  '7512b80f-c959-43de-996b-f4ae247effe6': 'relaxo',
+  '7515a26c-d350-4e86-bc4d-c47915e6ccfd': 'ulker',
+  '75abf8a6-f7cd-43cb-a436-8d6757bf555d': 'reliancesmart',
+  '75db217f-ee0a-49ba-b723-0ba1b33dd65e': 'internationalmotors',
+  '760236d5-8ce7-415b-9c00-664724e71757': 'greatkapital',
+  '7645dad6-41dc-4dab-8828-11a8c8f3af14': 'inorbit',
+  '76882cf1-3e9c-42fb-8829-17312ab8b1d2': 'asda',
+  '76afb94e-ec67-48d7-b51b-d9d838e2c2ca': 'mckesson',
+  '76fe69e1-6cec-4a1e-b143-1a6bc72bc891': 'taylormade',
+  '7824230f-6fb1-4e41-8879-8268e498e5e6': 'fdj',
+  '79488cce-e6be-4604-9a03-8bc44fd916aa': 'bigbasket',
+  '79c7d6df-067c-43a7-a57b-8867bd5b15e2': 'riteaid',
+  '7b5e0c6b-d3d1-45d0-9b7c-9d5409227759': 'nabors',
+  '7c21a887-1c35-48e1-bdbb-80a52f138545': 'perfetti',
+  '7c5945f1-91ba-45b8-96ef-5fc79328023c': 'virginmedia',
+  '7cd1d93d-9aba-445e-8979-73e2c7642e25': 'repsol',
+  '7dd6cfe7-3041-4695-b93b-f3ddd81f80f3': 'ablbl',
+  '7dec2ee1-38cd-4bc0-b5b5-25f882f8f4d3': 'danone',
+  '7e8b02cd-b125-43f8-9653-dcfc888f0d55': 'cpkc',
+  '7f7e8fd1-aba1-4f82-949a-3e7f0ac8e45f': 'lifetimebrands',
+  '806824dd-2232-443d-b8d5-15c063b85c66': 'naturelle',
+  '80763278-0cf8-45cc-9149-db7b81b9e5f8': 'globalfoundries',
+  '819b77d9-9ab6-40f3-96da-62bca31b4e3b': 'costco',
+  '81b3c48f-6ec7-45c3-9460-dfbe3c010d42': 'mpc',
+  '82ef6794-71c8-4113-9eaf-9c29c99494fa': 'pidilite',
+  '831f5012-0e40-4913-95bb-503d50a1794b': 'sysco',
+  '83b94e7f-4f71-46a0-b9a6-0ce47f5beb90': 'radico',
+  '83c46f5b-9225-4da3-b719-451d0ecbd4de': 'bestbuy',
+  '84159c04-e774-46da-b073-a836639e7e65': 'rsil',
+  '843494f6-916d-4abb-900e-5f3a36ab7cf7': 'singtel',
+  '84cb160e-5f7b-447f-8b4e-68f7d60b91c0': 'bioconbiologics',
+  '8539d830-1f0c-408e-9dbb-e79d9019e1ae': 'balco',
+  '856bc698-0487-49c5-8b54-e23a6f9ea152': 'pacificnational',
+  '86e3f3ae-b12d-41c4-869a-2d0a288c49a8': 'jswpaints',
+  '87f905a6-1d88-457f-90a6-c4e03fef34b1': 'singtel',
+  '88ea8862-32f0-4ebc-a7c0-e4c715f3320a': 'escorts',
+  '890ee872-0395-4b22-9980-934ebb3f802f': 'fieldfresh',
+  '89787cf8-12d8-4a78-9939-b0e22f7d127f': 'lcw',
+  '8a1b67a3-8704-4636-858a-d80aa9ac73df': 'ulta',
+  '8ab1b70c-5caa-46df-866a-cafba76f17b8': 'emami',
+  '8b30106d-fc54-4c2e-b618-b245cecdf26d': 'woolworths',
+  '8b3b080e-a1ea-4695-a0a0-99cea364aa22': 'itv',
+  '8bba945b-5913-4e60-8afa-3a1ee5f525e8': 'jfl',
+  '8c036d69-a428-4be9-a71e-bb3b72bbdd6c': 'crompton',
+  '8c0e6625-cfc4-4e5b-b0bd-6e026813c157': 'varroc',
+  '8c2d2494-5c2b-46b9-bf19-6ac585b4f07c': 'nfi',
+  '8d421b3c-05bb-4b68-a239-816eca6054bf': 'walgreens',
+  '8d88b218-d2e8-4032-92cf-2b2f3bb26541': 'kelloggs',
+  '8e20f951-39cd-40c5-86c6-d797a025ee34': 'siegwerk',
+  '8e2fc600-c51b-4b97-9b0b-9dda38b2279e': 'autonation',
+  '8e7f1e75-d7fc-47e8-be50-d1445de2849f': 'chevron',
+  '90176354-5bdd-489d-9e13-aed9e4c896af': 'eaton',
+  '901e61d6-4d85-4b0b-a661-469af2e788bc': 'vcpl',
+  '91317c07-8d22-4aed-9b03-ca10a43f4f11': 'exxonmobil',
+  '9226f8de-30d0-48f4-82ff-6cbca36e89e6': 'uber',
+  '929db81e-4fd8-4730-b744-832afcacfe90': 'homedepot',
+  '92fc8b82-3920-4ad6-899e-7107b7fffec3': 'thermofisher',
+  '935ae6ca-7d9d-4326-ae8a-c3df1db7fd31': 'lenskart',
+  '94f0855d-63f7-44a2-8d0c-a92cb78b513f': 'nordstrom',
+  '95d30e6f-4749-4879-9437-6202ae706ee7': 'cvshealth',
+  '96e04f3e-91ce-4e89-80ef-3209867e3ce5': 'sonatasoftware',
+  '96e41116-65b7-4cfb-824f-d189e8f387a6': 'jswcement',
+  '988797a6-7dd0-4717-9d84-9b9a1edfa9fa': 'virginmediao2',
+  '98c1b74f-aa38-44b7-93ce-41717fb9d6a0': 'sealedair',
+  '9944b9f1-0015-4a0f-b454-f72339782a46': 'officedepot',
+  '9971cafd-2c7b-44b5-b6fe-1e478fae832e': 'sephora',
+  '9a9cc67e-fc54-47a4-a678-7259dbd54dbe': 'vecv',
+  '9c6f542b-d0fd-44d1-ae30-22c67ab16f61': 'grupocinemex',
+  '9d35e98e-2d8e-4162-a9ef-14f309f3fe9d': 'eaton',
+  '9d68473e-d9b1-4016-88db-65b33033a3c1': 'coromandel',
+  '9d74ffa8-e9f2-4422-9dbf-a260e6580c42': 'linde',
+  '9e1a2e52-0a09-41c2-a439-7122a5af76da': 'tjx',
+  '9ea4d396-ec20-403b-8d25-42d8cf05ac10': 'amazon',
+  '9ed6531d-a932-4a7a-8f96-e6c42d13bb2c': 'nokia',
+  '9ff4e524-67be-4c32-bd55-3a6aa4565ad6': 'boots',
+  'a051ff6a-ef14-404a-b27f-9e02dc77eb81': 'lyreco',
+  'a08ae25e-11a8-456c-843f-f19a64fb4611': 'walmart',  // REVIEW
+  'a1af9eae-2bc1-466b-9cd0-540b721aa0b7': 'tcpl',
+  'a29789a7-d51e-4f75-b1b0-00876590a24e': 'caleres',
+  'a2ee5ba4-10f5-428c-8074-b01c40febae4': 'lexmark',
+  'a341fcf6-7ccc-4616-84bd-af5972fec02a': 'thermofisher',
+  'a3a54c84-be09-4ae1-a0e8-fce07a161d06': 'supervalu',  // REVIEW
+  'a545dece-4ea4-40c6-8416-8dee79b00f28': 'philips',
+  'a6afcffd-c474-492e-b944-9e89e7b433b9': 'leggettplatt',
+  'a6ece41c-8259-4c08-8364-188663072298': 'gtr',
+  'a7a90340-9133-49fd-8722-be8beb8e3aa5': 'lyreco',
+  'a8c92e09-3b64-44d7-8c62-2f9b38e42f2e': 'globalfoundries',
+  'a98b60fd-de7a-4e74-ae4b-a353a64cddca': 'dixongroup',
+  'a9c99ffa-b714-43e4-a076-c4bf444b1fe4': 'exxonmobil',
+  'a9fb1599-cd4a-4580-adb8-a3df19075eec': 'globusspirits',
+  'aa4a8e3e-1e27-4bea-a6df-7ff79f1f017b': 'thermofisher',
+  'ab241bb5-29e5-4262-bf38-4bc4499f23be': 'nvl',
+  'ab7c5f05-a2f1-4858-a578-fb8bdbc68779': 'bose',
+  'ab884e30-5fd5-4e14-aa78-57c4ba51d0ae': 'lyreco',
+  'abf59032-4c98-4626-916a-6e2b70d4d8a8': 'tbspl',
+  'ad50dd2e-30f1-43b8-b7ef-6006b600570b': 'abishowatech',
+  'ae5e2dd7-7ba0-4c5e-addd-8c15906f8d84': 'uber',
+  'aec65e43-8d9b-480b-accb-b3777ec25f92': 'infineum',
+  'af886c8a-6c92-4602-9c92-24ee12aca99f': 'cci',
+  'b04e2452-55e5-4d88-ba00-83a95cc6ae30': 'mediamarktsaturn',
+  'b05c599c-53df-4015-8250-0920b63221b0': 'sgws',
+  'b1398d90-8d17-44b8-bbf9-f9b1e1328df0': 'nerolac',
+  'b18888c9-e19f-4265-b748-374ae20aad6c': 'lyreco',
+  'b2b5cd59-713e-4f1a-a8da-259accd94e81': 'exxonmobil',
+  'b2bbf670-2a7c-4c00-8323-ecbc8a37849b': 'sncf',
+  'b47f8232-124b-41d4-aaa9-7e24c9355159': 'usfoods',
+  'b5c4eaec-499f-43fe-93bb-c2924f009fb4': 'wakefern',
+  'b6e7d4e2-1c2b-42ca-a0c9-6be624a08c9b': 'newmont',
+  'b7c6e148-d380-4c75-89cc-6869dcf2027f': 'relianceshein',
+  'b7d2e615-6ebf-4f1b-97a1-4b5b63d179d8': 'eii',
+  'b8293caf-4522-45ce-b24d-b77df0983eb6': 'perfetti',
+  'b8473073-4818-4fbf-b019-98d01f1ce941': 'hpe',
+  'ba73911c-b49a-48c2-ba73-fff8dce282f2': 'toysrus',
+  'ba8edf54-702f-4e4a-aed4-57d00e2b08f2': 'ihstowers',
+  'bb27feff-d905-4c3f-a59d-dc4877d10e79': 'homedepot',
+  'bd69f4eb-225c-4a15-9fe5-a7266a55d828': 'grupoposadas',
+  'bdb4e75f-d8dd-403b-88d5-4b69d9168a77': 'royalenfield',
+  'bfb0a43c-3a1c-434b-8b7e-aa2db2f25fdc': 'hp',
+  'c02359c4-26fb-457f-8547-12a1827c681a': 'lyreco',
+  'c03e7164-63be-4c66-8c07-3b11c887b4d2': 'danone',
+  'c03eb5e0-ef63-4b1b-9708-96db0e8bae60': 'philips',
+  'c077d530-df74-4901-9a18-094e1499f740': 'lyondellbasell',
+  'c0b92b93-15e8-4879-950f-62add73f10f9': 'daikin',
+  'c1070a0a-523b-4b1e-8483-d8f57b334347': 'hyvee',
+  'c1811190-f700-41ee-bd7c-fed1e870ffe9': 'mtr',
+  'c1ac9c25-c34c-4a7f-8a67-a07d7ecff293': 'macys',
+  'c1fa334e-bd47-4a59-8085-e31491f6a947': 'cn',
+  'c2478e37-74e9-44f5-97c9-d75be1d0abcd': 'whitbread',
+  'c2ac9633-bc0c-47a4-a257-375f9430cec0': 'latnitrogen',
+  'c2e5a4e1-9b9b-47e4-b428-a49ddb36ba12': 'praxair',
+  'c32ca6c4-e0ef-48b4-a602-55010ebbd529': 'philips',
+  'c37d446c-4666-4de5-bead-c540d3756868': 'mclane',
+  'c3f3cac5-2743-4c13-b4b9-bcfed991e3ad': 'princepipes',
+  'c541ab92-ffa2-4a07-9d76-ffcb1b2cbbcc': 'acc',
+  'c567aae5-4de4-4018-a7c4-cdbc3e438e2a': 'csx',
+  'c5af1b76-67ad-4909-83f9-a70951b9e6ba': 'tjxeu',
+  'c69eb105-f0f1-4c61-91a0-2ffb0122625a': 'mondelez',
+  'c75e9bcc-441d-4111-857d-0aa07e306c19': 'thermofisher',
+  'c791d982-4124-4d10-ba2f-6bcb38568ed6': 'alliedbakeries',
+  'c8552423-ff8e-4755-a376-018ea43cf2db': 'wickes',
+  'c8f5279c-7798-464a-9b81-1c13f8128547': 'lyreco',
+  'c9073b59-8d1e-4fcb-a8d3-e989821ac8b6': 'titan',
+  'cb536f41-e7dc-4345-aa8b-e16507b1b328': 'danone',
+  'cb5e311d-ea9c-46d1-8347-018aa641c000': 'futurelifestylefashions',
+  'cc55f123-6e61-4c58-b50b-92068322ce73': 'drreddys',
+  'ccabcd73-90cb-457a-9784-7e108a21f2c1': 'costco',
+  'cd7307eb-036d-4cda-a9d3-5e234844fcb2': 'arcelik',
+  'ceee6639-6280-44d6-b9f5-d76c4fea15b3': 'tatachemicals',
+  'cf24613e-6427-4e55-bd19-72f9d179bd53': 'sonova',
+  'cf29319b-e9f3-40ed-af43-6fb458ddf7db': 'kcsouthern',
+  'cf37e7d3-5803-47b3-b5b8-48aceafc1866': 'oriflame',
+  'cf63e10c-4dd3-4125-b4df-51f43fd3931b': 'lyreco',
+  'cf7fa4c1-4dc2-4ede-86a7-51a7ea7a0d2a': 'chevron',
+  'd004d5c5-a349-4b14-bce1-7cf66951b662': 'crv',
+  'd01c7949-450c-400b-98fc-fb52119c80b8': 'averydennison',
+  'd08099a3-c011-46e6-b066-ab6876344a59': 'jiomartpartner',
+  'd09195a8-7719-493a-a49b-d54dffefedd8': 'quad',
+  'd0ee0a0f-2a66-4c28-89f4-e194473b71d1': 'zjlianhua',
+  'd200d069-5748-4058-aeb7-b2738ba58f1c': 'russellinvestments',
+  'd212968a-94c3-42a1-8ff2-494f5b3bebff': 'asianpaints',
+  'd2320bd5-c920-47bb-aaae-12dc364fb824': 'tarmac',
+  'd299a910-d188-4dae-9312-186409af6edb': 'maersk',
+  'd2c31f36-e669-40e0-899e-37e4465a6b7b': 'perfetti',
+  'd45ed6b7-bb5b-45a1-8752-dcf54da51b3d': 'mtn',
+  'd485c77e-aa03-463a-90f3-2b1e63274a81': 'intel',
+  'd610a0fa-e250-4eea-a714-26d1f3df6666': 'pvm',
+  'd8223aa1-e2c1-47f6-a925-27fae8ba288e': 'macys',
+  'd82cbb47-df66-4f06-8676-3cb00939442a': 'amazon',
+  'd8f92f9f-2713-476a-9d17-b75309a98f8e': 'endeavour',
+  'd8fdfc75-bd28-45fc-bfab-3cc72e49c983': 'nokia',
+  'd9b31ba3-9b3c-4ec0-957d-bcc3dfeb0795': 'amazon',
+  'd9e56577-ed74-4621-94b9-b3f41b58e2d0': 'vecv',
+  'da82faee-b27d-48d0-8cef-bdf438b51b78': 'hul',
+  'dd2a4c00-6d71-4759-8749-cc21119127d1': 'mediamarktsaturn',
+  'ddb537ca-e051-4c83-b38d-f6301176b0bd': 'perfetti',
+  'dde72b61-6319-4953-bf28-8c3742472200': 'unilever',
+  'de1b521b-a9e5-4fc4-b42b-9562affa86f9': 'tilind',
+  'de30f515-e966-467a-8d3f-245c90e71696': 'abm',
+  'de46b78e-9f80-40d7-a05a-1c8511e661fd': 'marksandspencer',
+  'de4d7f12-aade-482f-89b3-97a62c205175': 'couchetard',
+  'de7d9904-6c4c-4d38-b3dc-012bb95d4880': 'astral',
+  'de9b8e28-36b8-47d9-bad7-ecc5632d793c': 'dsg',
+  'df08bc35-4f93-4ed7-a352-ac54e89c32c0': 'amazon',
+  'df15194b-6897-4c23-89ef-bfaf7c577f81': 'unfi',
+  'dfbe595f-d003-4b9d-9c82-eaa8416bce47': 'mpc',
+  'e18e9815-7280-403f-a5a2-7f8f991659b3': 'nationwide',
+  'e1d86aca-29f7-403e-b0c5-06a5a6db4120': 'wipro',
+  'e37d5840-d5ef-499a-8979-3589b5a68a1f': 'comfortdelgro',
+  'e59e6fda-933c-4c81-844b-8eb3c98d1bc2': 'treehousefoods',
+  'e5be9604-455f-4c35-8351-a168d4fd2f7f': 'arvindfashions',
+  'e5fa1e91-47e1-483d-908c-0a9b8224a3d6': 'chevron',
+  'e660cd3b-8b40-4406-8fe4-2d47c1bc491d': 'sudarshan',
+  'e79baf28-a12c-44f8-a956-bd27cfe6b51a': 'abbvie',
+  'e892d956-a140-4aae-a47d-68d5b4956eb9': 'amazon',
+  'e98638b4-3395-4bc5-880d-a42b6b1ade44': 'travisperkins',
+  'ea447882-2435-4c66-b4f2-9a272510eed9': 'amazon',
+  'ea908a43-68f6-44c4-94c5-2eeb8c903eaa': 'thermofisher',
+  'eae92cb6-8c03-480a-8ccb-631141e7eb51': 'cyient',
+  'eb4e4f76-b8a2-4dd7-a9f4-b7f78e2463f0': 'walmart-chile',
+  'ed2d9b42-f109-48ef-a032-6d3346c9b01a': 'jetro',
+  'edeeda63-425c-4871-b982-f4c2d42bdd6b': 'zkh360',
+  'ef1a8d71-cccc-430a-8932-e56cca70e60d': 'bunzl',
+  'ef441eda-8549-44ea-b151-e234cf058ca9': 'rocketkommerce',
+  'efbeca86-cdf8-40c5-910d-aaafa7745155': 'apple',
+  'efead9cf-a945-4d84-99e0-7465223f3bef': 'chevron',
+  'f066ebc1-e2ec-46ce-a83c-0a3f2ea487e3': 'globalfoundries',
+  'f0ffb21d-368d-44d1-abf1-27990dcece8c': 'tvsmotor',
+  'f15362ac-4ef3-4a86-8c5b-b12ca649f662': 'lmwind',
+  'f1a3cbfa-dd8c-48bb-bd98-d3d2cd97713c': 'srf',
+  'f1eb19e2-5236-4baf-9624-4591acd85618': 'lyreco',
+  'f292f537-e7ee-49a7-9938-34ef9852b9ae': 'carlsberg',
+  'f3e8aad8-8eff-4a10-8e41-45aecc7cdec3': 'kroger',
+  'f643dae0-ea2d-4318-bf63-4fcfb575a8b8': 'costco',
+  'f6efa4e4-8f3f-461c-bfd4-2c34a1c72fd0': 'bny',
+  'f74d8fce-9e3b-4919-ab51-dca5cf0ca134': 'lyreco',
+  'f76b0a62-85bc-44b7-afc9-5c9c01cfc542': 'unitedsupermarkets',
+  'f7ca50ac-3363-42bd-b0fe-5ec856005cc2': 'mastercard',
+  'f86d04db-fbe5-4432-b58f-2c8bcf3a7a24': 'alliedblenders',
+  'f988a586-7c2f-4e4a-9670-d6294adb4fb1': 'nxp',
+  'fc16eee2-be61-45bc-8188-a3d44a1cc4cb': 'mahindracie',
+  'fc7119d2-5e35-4351-a603-924258732512': 'jmc',
+  'fd2337c6-e11b-4947-8c76-ad41e6e8077a': 'anadoluefes',
+  'fd33ccfd-0564-4be8-aad9-bc3da1cc3dcb': 'agrati',
+  'fdb612a2-41e6-4a99-9a2e-e3c5aeb3a9db': 'asdaold',  // REVIEW
+  'fdd611cb-51d4-4e22-b3b9-991a4f246b8b': 'betterlife',
+  'fedc7371-c7a2-4af0-8170-a0226237e262': 'thermofisher',
+  'ffcf76ee-382c-4d2b-b447-047ff3ab53ea': 'rallis',
+};
+
+const MAX_ASSOCIATED_ROWS = 15;   // rows shown in the alert table (rest become "+N more")
+const MAX_MISSING_NAMES = 12;     // buyer names shown in the "missing" block
+const MAX_DIVISIONS_PER_COMPANY = 5000; // safety limit, refuse partial data beyond this
+const MAX_ROLLUP_AGE_HOURS = 192;       // ignore a company snapshot older than 8 days (rebuilt weekly)
+// true  = ignore the stored company snapshot and read the Divisions live at the moment of send
+//         (used for the test: roll-up happens at send time; 5 to 9 API calls per contact).
+// false = use the snapshot when it is fresh (3 API calls per contact), live only when it is not.
+const FORCE_LIVE_ROLLUP = true;
+
+const FIND_YOUR_BUYER_URL = 'https://c2fo.com/find-your-buyer/';
+const EXPAND_NETWORK_URL =
+  'https://app.c2fo.com/login?redirect-to=https%3A%2F%2Fapp.c2fo.com%2Fenterprise%2Fsupplier%2Ffind-your-customers%2Fexpand-your-network';
+
+const DIVISION_PROPERTIES = [
+  'buyer_division_uuid',
+  'buyer_division_name',
+  'eligible_invoice_amount',
+  'eligible_invoice_count',
+  'currency',
+  'market_good_funds_date',
+  'market_is_enabled'
+];
+
+// ----- Small helpers ------------------------------------------------------------
+const text = (v) => (v == null ? '' : String(v));
+const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let apiCalls = 0; // counted per run, logged at the end (see "api calls" log line)
+
+const statusOf = (error) =>
+  Number(error?.response?.statusCode ?? error?.statusCode ?? error?.status ?? error?.code);
+
+// Rate limits (429): HubSpot allows short bursts only (this key: 25 calls per second,
+// 250 per 10 seconds), so when many contacts run at once some calls get a 429.
+// Retry up to 4 times with growing waits plus random jitter (about 8 seconds in the
+// worst case, well inside the 20-second action limit), then fail so the workflow
+// can retry the action later.
+// Server errors / network blips: up to 2 short retries.
+const RATE_LIMIT_WAITS_MS = [800, 1600, 2400, 3200];
+async function withRetry(operation, label) {
+  let rateLimitRetries = 0;
+  let otherRetries = 0;
+  for (;;) {
+    try {
+      apiCalls += 1;
+      return await operation();
+    } catch (error) {
+      const status = statusOf(error);
+      if (status === 429) {
+        if (rateLimitRetries >= RATE_LIMIT_WAITS_MS.length) {
+          console.log(`${label}: still rate limited after ${rateLimitRetries} retries; rethrowing so HubSpot retries this action later`);
+          throw error;
+        }
+        const wait = RATE_LIMIT_WAITS_MS[rateLimitRetries] + Math.floor(Math.random() * 500);
+        rateLimitRetries += 1;
+        console.log(`${label} rate limited; retry ${rateLimitRetries}/${RATE_LIMIT_WAITS_MS.length} in ${wait}ms`);
+        await sleep(wait);
+        continue;
+      }
+      const transient =
+        status >= 500 || ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(error?.code);
+      if (!transient || otherRetries >= 2) throw error;
+      otherRetries += 1;
+      const wait = 300 * otherRetries;
+      console.log(`${label} transient failure; retrying in ${wait}ms`);
+      await sleep(wait);
+    }
+  }
+}
+
+// ----- Language ------------------------------------------------------------------
+// The contact property hubspot_email_language holds free text. Values seen in the
+// portal: "amer english", "global english", "german", "spanish", "french",
+// "simplified chinese", "italian", "portuguese". Anything else falls back to English.
+function resolveLocale(rawLanguage) {
+  const v = text(rawLanguage).trim().toLowerCase();
+  const is = (...keys) => keys.some((k) => v === k || v.startsWith(`${k}-`) || v.startsWith(`${k}_`));
+  if (is('es') || v.includes('spanish') || v.includes('español')) return 'es';
+  if (is('fr') || v.includes('french') || v.includes('français')) return 'fr';
+  if (is('de') || v.includes('german') || v.includes('deutsch')) return 'de';
+  if (is('it') || v.includes('italian') || v.includes('italiano')) return 'it';
+  if (is('pt') || v.includes('portuguese') || v.includes('português')) return 'pt';
+  if (is('zh') || v.includes('chinese') || v.includes('中文') || v.includes('简体')) return 'zh';
+  return 'en';
+}
+
+// Locale tags used for number / date formatting.
+const INTL_LOCALE = {
+  en: 'en-US', es: 'es-MX', fr: 'fr-FR', de: 'de-DE', it: 'it-IT', pt: 'pt-BR', zh: 'zh-CN'
+};
+
+// NOTE: translations below were drafted by Claude and have NOT been reviewed by
+// native speakers. Have each language reviewed before the first send.
+const LOCALES = {
+  en: {
+    colCustomer: 'Customer', colInvoices: 'Available invoices', colAmount: 'Available AR', colFunds: 'Funds by',
+    moreCustomers: (n) => `+ ${n} more customer${n === 1 ? '' : 's'}`,
+    andMore: (n) => `and ${n} more`,
+    unnamed: 'Unnamed customer', multiCurrency: 'Multiple currencies', yourCompany: 'your company',
+    nudgeHeading: (c) => `Did you know ${c} has multiple customers on the C2FO platform?`,
+    nudgeBody: (link) => `To ensure that you have access to all your eligible customer invoices on your C2FO account, review your list and ${link}.`,
+    nudgeLink: 'add missing customers here',
+    // English only for now: the invoice count goes in the subject and headline (a function of the count).
+    alertSubject: (n, company) => `${company ? company + ': ' : ''}${n === 1 ? 'You have 1 invoice available' : `You have ${n.toLocaleString('en-US')} invoices available`}`,
+    alertHeadline: (n) => (n === 1 ? 'You have 1 invoice available for early payment' : `You have ${n.toLocaleString('en-US')} invoices available for early payment`),
+    alertIntro: 'Here\'s a breakdown of your available invoices:',
+    alertButton: 'View Your Invoices',
+    alertFootnote: (asOf) => `Eligible invoice amounts as of ${asOf} may change as invoices are updated.`,
+    nudgeSubject: () => 'Are you missing early payment opportunities with your customers?', nudgeHeadline: 'Are you missing early payment opportunities with your customers?',
+    nudgeButton: 'Add Missing Customers', nudgeFootnote: 'Customers listed are those on the C2FO platform that are linked to your company.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Here\'s a breakdown of your available invoices:',
+    nudgeHeadingOne: (c, b) => `Did you know ${b} is a customer of ${c} on the C2FO platform?`,
+    nudgeLinkOne: 'add the missing customer here',
+    nudgeSubjectOne: () => 'Are you missing early payment opportunities with your customers?', nudgeButtonOne: 'Add Missing Customer',
+    nudgeFootnoteOne: 'The customer named above is on the C2FO platform and is linked to your company.',
+    closing: 'Remember, you can accelerate your invoices with C2FO on-demand, ensuring your company can optimize your cash flow and manage your financial metrics.',
+    // English-only per-email closing text and linking-box wording (Email A box has a link; Email B box does not).
+    alertClosing: 'Access your invoices and choose when to get paid early. With C2FO, you can unlock cash when you need it and take greater control of your cash flow.',
+    nudgeClosing: 'Already working with these customers? Review your customer list and add any missing connections to make the most of your early payment opportunities.',
+    nudgeClosingOne: 'Already working with this customer? Review your customer list and add any missing connections to make the most of your early payment opportunities.',
+    boxA: {
+      headOne: (b) => `Do you work with ${b}? They\'re already on the C2FO platform!`,
+      head: 'Do you work with any of these customers? They\'re already on the C2FO platform!',
+      body: (link) => `You could be missing out on additional early payment opportunities. Review your customer list and ${link}.`,
+      // Non-registered contacts (link text is "add all your eligible customers here")
+      bodyUnreg: (link) => `You could be missing out on additional early payment opportunities. Register on C2FO and ${link}.`,
+      linkUnreg: 'add all your eligible customers here'
+    },
+    boxB: {
+      headOne: (b) => `Do you work with ${b}?`,
+      bodyOne: 'It\'s already on the C2FO platform! Make sure it\'s linked to your account so you can access any eligible invoices for early payment.',
+      head: 'Do you work with any of these customers?',
+      body: 'They\'re already on the C2FO platform! Make sure they\'re linked to your account so you can access any eligible invoices for early payment.',
+      // Non-registered contacts (no account yet)
+      bodyOneNew: 'They\'re already on the C2FO platform! Register to access any eligible invoices for early payment.',
+      bodyNew: 'They\'re already on the C2FO platform! Register to access any eligible invoices for early payment.'
+    },
+    nudgeButtonNew: 'Register on C2FO',
+    nudgeClosingNew: 'Already working with these customers? Register on C2FO and add all your eligible customers to make the most of your early payment opportunities.',
+    nudgeClosingOneNew: 'Already working with this customer? Register on C2FO and add all your eligible customers to make the most of your early payment opportunities.',
+  },
+  es: {
+    colCustomer: 'Cliente', colInvoices: 'Facturas elegibles', colAmount: 'Monto elegible', colFunds: 'Fondos para',
+    moreCustomers: (n) => `+ ${n} cliente${n === 1 ? '' : 's'} más`,
+    andMore: (n) => `y ${n} más`,
+    unnamed: 'Cliente sin nombre', multiCurrency: 'Varias monedas', yourCompany: 'su empresa',
+    nudgeHeading: (c) => `¿Sabía que ${c} tiene varios clientes en la plataforma de C2FO?`,
+    nudgeBody: (link) => `Para asegurarse de tener acceso a todas sus facturas elegibles de clientes en su cuenta de C2FO, revise su lista y ${link}.`,
+    nudgeLink: 'agregue aquí los clientes que faltan',
+    alertSubject: 'Sus facturas son elegibles para pronto pago', alertHeadline: 'Sus facturas son elegibles para pronto pago',
+    alertIntro: 'Estos clientes tienen actualmente facturas disponibles para pronto pago en su cuenta de C2FO:',
+    alertButton: 'Ver sus facturas',
+    alertFootnote: 'Los montos mostrados corresponden a facturas actualmente elegibles para pronto pago y pueden cambiar a medida que se actualicen las facturas.',
+    nudgeSubject: (c) => `¿Sabía que ${c} tiene más clientes en C2FO?`, nudgeHeadline: 'Asegúrese de no perder facturas elegibles',
+    nudgeButton: 'Agregar clientes que faltan', nudgeFootnote: 'Los clientes mostrados son los de la plataforma C2FO vinculados a su empresa.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Este cliente tiene actualmente facturas disponibles para pronto pago en su cuenta de C2FO:',
+    nudgeHeadingOne: (c, b) => `¿Sabía que ${b} es cliente de ${c} en la plataforma de C2FO?`,
+    nudgeLinkOne: 'agregue aquí el cliente que falta',
+    nudgeSubjectOne: (c) => `¿Sabía que ${c} tiene un cliente en C2FO?`, nudgeButtonOne: 'Agregar cliente que falta',
+    nudgeFootnoteOne: 'El cliente mencionado arriba está en la plataforma C2FO y está vinculado a su empresa.',
+    closing: 'Recuerde que puede acelerar el cobro de sus facturas con C2FO bajo demanda, para que su empresa optimice su flujo de caja y gestione sus indicadores financieros.',
+  },
+  fr: {
+    colCustomer: 'Client', colInvoices: 'Factures éligibles', colAmount: 'Montant éligible', colFunds: 'Fonds le',
+    moreCustomers: (n) => `+ ${n} autre${n === 1 ? '' : 's'} client${n === 1 ? '' : 's'}`,
+    andMore: (n) => `et ${n} autre${n === 1 ? '' : 's'}`,
+    unnamed: 'Client sans nom', multiCurrency: 'Plusieurs devises', yourCompany: 'votre entreprise',
+    nudgeHeading: (c) => `Saviez-vous que ${c} compte plusieurs clients sur la plateforme C2FO ?`,
+    nudgeBody: (link) => `Pour vous assurer d'avoir accès à toutes vos factures clients éligibles sur votre compte C2FO, consultez votre liste et ${link}.`,
+    nudgeLink: 'ajoutez ici les clients manquants',
+    alertSubject: 'Vos factures sont éligibles à un règlement anticipé', alertHeadline: 'Vos factures sont éligibles à un règlement anticipé',
+    alertIntro: 'Ces clients ont actuellement des factures disponibles pour un règlement anticipé sur votre compte C2FO :',
+    alertButton: 'Voir vos factures',
+    alertFootnote: 'Les montants indiqués correspondent aux factures actuellement éligibles à un règlement anticipé et peuvent changer à mesure que les factures sont mises à jour.',
+    nudgeSubject: (c) => `Saviez-vous que ${c} a d'autres clients sur C2FO ?`, nudgeHeadline: 'Ne manquez aucune facture éligible',
+    nudgeButton: 'Ajouter les clients manquants', nudgeFootnote: 'Les clients indiqués sont ceux de la plateforme C2FO liés à votre entreprise.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Ce client a actuellement des factures disponibles pour un règlement anticipé sur votre compte C2FO :',
+    nudgeHeadingOne: (c, b) => `Saviez-vous que ${b} est client de ${c} sur la plateforme C2FO ?`,
+    nudgeLinkOne: 'ajoutez ici le client manquant',
+    nudgeSubjectOne: (c) => `Saviez-vous que ${c} a un client sur C2FO ?`, nudgeButtonOne: 'Ajouter le client manquant',
+    nudgeFootnoteOne: 'Le client mentionné ci-dessus est sur la plateforme C2FO et lié à votre entreprise.',
+    closing: 'N\'oubliez pas que vous pouvez accélérer le paiement de vos factures avec C2FO à la demande, afin que votre entreprise optimise sa trésorerie et gère ses indicateurs financiers.',
+  },
+  de: {
+    colCustomer: 'Kunde', colInvoices: 'Berechtigte Rechnungen', colAmount: 'Berechtigter Betrag', colFunds: 'Auszahlung bis',
+    moreCustomers: (n) => (n === 1 ? '+ 1 weiterer Kunde' : `+ ${n} weitere Kunden`),
+    andMore: (n) => `und ${n} weitere`,
+    unnamed: 'Unbenannter Kunde', multiCurrency: 'Mehrere Währungen', yourCompany: 'Ihr Unternehmen',
+    nudgeHeading: (c) => `Wussten Sie, dass ${c} mehrere Kunden auf der C2FO-Plattform hat?`,
+    nudgeBody: (link) => `Damit Sie in Ihrem C2FO-Konto Zugriff auf alle berechtigten Kundenrechnungen haben, prüfen Sie Ihre Liste und ${link}.`,
+    nudgeLink: 'fügen Sie hier fehlende Kunden hinzu',
+    alertSubject: 'Ihre Rechnungen sind für die vorzeitige Zahlung berechtigt', alertHeadline: 'Ihre Rechnungen sind für die vorzeitige Zahlung berechtigt',
+    alertIntro: 'Für diese Kunden sind in Ihrem C2FO-Konto derzeit Rechnungen für die vorzeitige Zahlung verfügbar:',
+    alertButton: 'Rechnungen ansehen',
+    alertFootnote: 'Die angezeigten Beträge entsprechen Rechnungen, die derzeit für die vorzeitige Zahlung berechtigt sind, und können sich bei Aktualisierung der Rechnungen ändern.',
+    nudgeSubject: (c) => `Wussten Sie, dass ${c} weitere Kunden bei C2FO hat?`, nudgeHeadline: 'Verpassen Sie keine berechtigten Rechnungen',
+    nudgeButton: 'Fehlende Kunden hinzufügen', nudgeFootnote: 'Die aufgeführten Kunden sind Kunden der C2FO-Plattform, die mit Ihrem Unternehmen verknüpft sind.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Für diesen Kunden sind in Ihrem C2FO-Konto derzeit Rechnungen für die vorzeitige Zahlung verfügbar:',
+    nudgeHeadingOne: (c, b) => `Wussten Sie, dass ${b} Kunde von ${c} auf der C2FO-Plattform ist?`,
+    nudgeLinkOne: 'fügen Sie hier den fehlenden Kunden hinzu',
+    nudgeSubjectOne: (c) => `Wussten Sie, dass ${c} einen Kunden bei C2FO hat?`, nudgeButtonOne: 'Fehlenden Kunden hinzufügen',
+    nudgeFootnoteOne: 'Der oben genannte Kunde ist auf der C2FO-Plattform und mit Ihrem Unternehmen verknüpft.',
+    closing: 'Denken Sie daran: Mit C2FO On-Demand können Sie Ihre Rechnungen beschleunigen und so den Cashflow Ihres Unternehmens optimieren und Ihre Finanzkennzahlen steuern.',
+  },
+  it: {
+    colCustomer: 'Cliente', colInvoices: 'Fatture idonee', colAmount: 'Importo idoneo', colFunds: 'Fondi entro',
+    moreCustomers: (n) => (n === 1 ? '+ 1 altro cliente' : `+ ${n} altri clienti`),
+    andMore: (n) => `e altri ${n}`,
+    unnamed: 'Cliente senza nome', multiCurrency: 'Più valute', yourCompany: 'la tua attività',
+    nudgeHeading: (c) => `Lo sapevi che ${c} ha più clienti sulla piattaforma C2FO?`,
+    nudgeBody: (link) => `Per assicurarti di avere accesso a tutte le fatture idonee dei tuoi clienti sul tuo account C2FO, controlla l'elenco e ${link}.`,
+    nudgeLink: 'aggiungi qui i clienti mancanti',
+    alertSubject: 'Le tue fatture sono idonee al pagamento anticipato', alertHeadline: 'Le tue fatture sono idonee al pagamento anticipato',
+    alertIntro: 'Questi clienti hanno attualmente fatture disponibili per il pagamento anticipato sul tuo account C2FO:',
+    alertButton: 'Visualizza le tue fatture',
+    alertFootnote: 'Gli importi mostrati si riferiscono a fatture attualmente idonee al pagamento anticipato e possono cambiare con l\'aggiornamento delle fatture.',
+    nudgeSubject: (c) => `Lo sapevi che ${c} ha altri clienti su C2FO?`, nudgeHeadline: 'Non perdere le fatture idonee',
+    nudgeButton: 'Aggiungi i clienti mancanti', nudgeFootnote: 'I clienti elencati sono quelli sulla piattaforma C2FO collegati alla tua attività.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Questo cliente ha attualmente fatture disponibili per il pagamento anticipato sul tuo account C2FO:',
+    nudgeHeadingOne: (c, b) => `Lo sapevi che ${b} è un cliente di ${c} sulla piattaforma C2FO?`,
+    nudgeLinkOne: 'aggiungi qui il cliente mancante',
+    nudgeSubjectOne: (c) => `Lo sapevi che ${c} ha un cliente su C2FO?`, nudgeButtonOne: 'Aggiungi il cliente mancante',
+    nudgeFootnoteOne: 'Il cliente indicato sopra è sulla piattaforma C2FO e collegato alla tua attività.',
+    closing: 'Ricorda che puoi accelerare le tue fatture con C2FO on demand, per ottimizzare il flusso di cassa della tua azienda e gestire i tuoi indicatori finanziari.',
+  },
+  pt: {
+    colCustomer: 'Cliente', colInvoices: 'Faturas elegíveis', colAmount: 'Valor elegível', colFunds: 'Fundos até',
+    moreCustomers: (n) => `+ ${n} cliente${n === 1 ? '' : 's'} a mais`,
+    andMore: (n) => `e mais ${n}`,
+    unnamed: 'Cliente sem nome', multiCurrency: 'Várias moedas', yourCompany: 'sua empresa',
+    nudgeHeading: (c) => `Você sabia que ${c} tem vários clientes na plataforma C2FO?`,
+    nudgeBody: (link) => `Para garantir que você tenha acesso a todas as faturas elegíveis de clientes na sua conta C2FO, revise sua lista e ${link}.`,
+    nudgeLink: 'adicione aqui os clientes que faltam',
+    alertSubject: 'Suas faturas são elegíveis para pagamento antecipado', alertHeadline: 'Suas faturas são elegíveis para pagamento antecipado',
+    alertIntro: 'Estes clientes têm atualmente faturas disponíveis para pagamento antecipado na sua conta C2FO:',
+    alertButton: 'Ver suas faturas',
+    alertFootnote: 'Os valores exibidos referem-se a faturas atualmente elegíveis para pagamento antecipado e podem mudar à medida que as faturas forem atualizadas.',
+    nudgeSubject: (c) => `Você sabia que ${c} tem mais clientes na C2FO?`, nudgeHeadline: 'Não perca faturas elegíveis',
+    nudgeButton: 'Adicionar clientes que faltam', nudgeFootnote: 'Os clientes listados são aqueles da plataforma C2FO vinculados à sua empresa.',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: 'Este cliente tem atualmente faturas disponíveis para pagamento antecipado na sua conta C2FO:',
+    nudgeHeadingOne: (c, b) => `Você sabia que ${b} é cliente de ${c} na plataforma C2FO?`,
+    nudgeLinkOne: 'adicione aqui o cliente que falta',
+    nudgeSubjectOne: (c) => `Você sabia que ${c} tem um cliente na C2FO?`, nudgeButtonOne: 'Adicionar cliente que falta',
+    nudgeFootnoteOne: 'O cliente mencionado acima está na plataforma C2FO e vinculado à sua empresa.',
+    closing: 'Lembre-se: você pode antecipar suas faturas com a C2FO sob demanda, para que sua empresa otimize o fluxo de caixa e gerencie seus indicadores financeiros.',
+  },
+  zh: {
+    colCustomer: '客户', colInvoices: '符合条件的发票', colAmount: '符合条件的金额', colFunds: '到账日期',
+    moreCustomers: (n) => `另有 ${n} 位客户`,
+    andMore: (n) => `以及另外 ${n} 位`,
+    unnamed: '未命名客户', multiCurrency: '多种货币', yourCompany: '贵公司',
+    nudgeHeading: (c) => `您知道吗？${c}在 C2FO 平台上有多个客户`,
+    nudgeBody: (link) => `为确保您能在 C2FO 账户中查看所有符合条件的客户发票，请查看您的客户列表并${link}。`,
+    nudgeLink: '在此添加缺失的客户',
+    alertSubject: '您的发票可申请提前回款', alertHeadline: '您的发票可申请提前回款',
+    alertIntro: '以下客户目前在您的 C2FO 账户中有可提前回款的发票：',
+    alertButton: '查看您的发票',
+    alertFootnote: '所示金额为目前可申请提前回款的发票，可能会随发票更新而变化。',
+    nudgeSubject: (c) => `您知道吗？${c}在 C2FO 上有更多客户`, nudgeHeadline: '不要错过符合条件的发票',
+    nudgeButton: '添加缺失的客户', nudgeFootnote: '所列客户为 C2FO 平台上与贵公司关联的客户。',
+    // Singular wording, used when exactly one buyer is involved.
+    alertIntroOne: '该客户目前在您的 C2FO 账户中有可提前回款的发票：',
+    nudgeHeadingOne: (c, b) => `您知道吗？${b}是${c}在 C2FO 平台上的客户`,
+    nudgeLinkOne: '在此添加缺失的客户',
+    nudgeSubjectOne: (c) => `您知道吗？${c}在 C2FO 上有客户`, nudgeButtonOne: '添加缺失的客户',
+    nudgeFootnoteOne: '上述客户是 C2FO 平台上与贵公司关联的客户。',
+    closing: '请记住，您可以通过 C2FO 按需功能加快发票回款，帮助贵公司优化现金流并管理财务指标。',
+  }
+};
+
+function formatMoney(amount, currency, locale) {
+  const code = text(currency).trim().toUpperCase() || 'USD';
+  const tag = INTL_LOCALE[locale] || 'en-US';
+  // Mexican pesos: keep the explicit "MX $" prefix used elsewhere (AO V3).
+  if (code === 'MXN') {
+    return `MX $${new Intl.NumberFormat(tag, { maximumFractionDigits: 0 }).format(amount)}`;
+  }
+  try {
+    return new Intl.NumberFormat(tag, {
+      style: 'currency',
+      currency: code,
+      maximumFractionDigits: 0
+    }).format(amount);
+  } catch {
+    return `${Math.round(amount).toLocaleString(tag)} ${code}`.trim();
+  }
+}
+
+function formatDate(value, locale) {
+  const raw = text(value).trim();
+  if (!raw) return '';
+  const date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+  return Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleDateString(INTL_LOCALE[locale] || 'en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        timeZone: 'UTC'
+      });
+}
+
+// ----- HubSpot reads -------------------------------------------------------------
+
+// Latest HubSpot rate-limit headers seen (burst + daily). Logged once per run so a
+// test shows the real limits for this key instead of us estimating them.
+let rateInfo = {};
+
+// Plain REST GET (instead of the client library) so the response headers are
+// readable. Same call count as the client would make.
+async function restGet(path, label) {
+  const token = process.env.EAP_SERVICE_KEY_TOKEN;
+  const response = await fetch(`https://api.hubapi.com${path}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+  });
+  const info = {};
+  response.headers.forEach((value, name) => {
+    if (name.toLowerCase().startsWith('x-hubspot-ratelimit')) {
+      info[name.toLowerCase().replace('x-hubspot-ratelimit-', '').replace('x-hubspot-ratelimit', 'burst-max')] = value;
+    }
+  });
+  if (Object.keys(info).length) rateInfo = info;
+  if (!response.ok) {
+    const error = new Error(`${label}: HTTP ${response.status}`);
+    error.statusCode = response.status;
+    error.code = response.status;
+    error.isAxiosError = true;
+    error.response = { status: response.status, statusCode: response.status, headers: {} };
+    throw error;
+  }
+  return response.json();
+}
+
+// All IDs associated to a record, following pagination. Optionally keeps only
+// links that carry the given association type ID.
+async function associatedIds(client, fromType, fromId, toType, typeId, limit) {
+  const ids = [];
+  let after;
+  const seen = new Set();
+  for (let page = 0; page < 200; page += 1) {
+    const query = `limit=500${after != null ? `&after=${encodeURIComponent(after)}` : ''}`;
+    const response = await withRetry(
+      () =>
+        restGet(
+          `/crm/v4/objects/${fromType}/${fromId}/associations/${toType}?${query}`,
+          `${fromType} ${fromId} -> ${toType} associations`
+        ),
+      `${fromType} ${fromId} -> ${toType} associations`
+    );
+    for (const item of response.results || []) {
+      const types = (item.associationTypes || []).map((t) => Number(t.typeId));
+      if (typeId == null || types.includes(typeId) || types.length === 0) {
+        ids.push(text(item.toObjectId));
+      }
+    }
+    if (limit && ids.length > limit) {
+      throw new Error(
+        `${fromType} ${fromId} has more than ${limit} ${toType} associations; refusing partial data`
+      );
+    }
+    const next = response.paging?.next?.after;
+    if (next == null) return ids;
+    if (seen.has(String(next))) throw new Error('Repeated pagination cursor');
+    seen.add(String(next));
+    after = next;
+  }
+  throw new Error('Association paging exceeded its safety limit; refusing partial data');
+}
+
+async function readDivisions(client, ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const response = await withRetry(
+      () =>
+        client.crm.objects.batchApi.read(DIVISION_TYPE, {
+          properties: DIVISION_PROPERTIES,
+          propertiesWithHistory: [],
+          inputs: chunk.map((id) => ({ id }))
+        }),
+      'Division batch read'
+    );
+    out.push(...(response.results || []));
+  }
+  return out;
+}
+
+// ----- Roll-up ----------------------------------------------------------------------
+
+function isEligible(division) {
+  const p = division.properties || {};
+  return (
+    num(p.eligible_invoice_amount) > 0 &&
+    text(p.market_is_enabled).toLowerCase() !== 'false' &&
+    text(p.buyer_division_uuid).trim() !== '' &&
+    !isBlockedBuyer(text(p.buyer_division_uuid))
+  );
+}
+
+// A buyer is blocked when it is not on the allowlist, or it is paused/suppressed.
+function isBlockedBuyer(uuid) {
+  const u = text(uuid).trim().toLowerCase();
+  return !ALLOWED_BUYER_UUIDS.has(u) || SUPPRESSED_BUYERS.has(u);
+}
+
+function isTruthyCell(v) {
+  return v === true || v === 1 || String(v).trim().toLowerCase() === 'true' || String(v).trim() === '1';
+}
+
+// Pure helper (easy to test): HubDB rows -> Set of suppressed buyer UUIDs.
+function suppressedFromRows(rows, nowMs) {
+  const out = new Set();
+  for (const row of rows || []) {
+    const v = row.values || {};
+    const uuid = text(v.buyer_uuid).trim().toLowerCase();
+    if (!uuid || !isTruthyCell(v.active)) continue;
+    const resume = v.resume_on;
+    if (resume != null && resume !== '') {
+      const ms = typeof resume === 'number' ? resume : Date.parse(resume);
+      if (Number.isFinite(ms) && ms <= nowMs) continue; // pause has ended
+    }
+    out.add(uuid);
+  }
+  return out;
+}
+
+async function loadSuppressedBuyers() {
+  if (!PAUSE_TABLE_ENABLED) return new Set(EXCLUDED_BUYER_UUIDS);
+  const response = await withRetry(
+    () => restGet(`/cms/v3/hubdb/tables/${SUPPRESSION_TABLE}/rows?limit=500`, 'HubDB suppression table'),
+    'HubDB suppression table'
+  );
+  const set = suppressedFromRows(response.results, Date.now());
+  EXCLUDED_BUYER_UUIDS.forEach((u) => set.add(u.toLowerCase()));
+  return set;
+}
+
+// True when the contact is tied to at least one Division we can see and EVERY one
+// of those Divisions belongs to a blocked buyer (not on the allowlist, or paused) (so we send nothing at all,
+// not even a nudge about the company's other buyers).
+function allLinkedDivisionsSuppressed(divisions, contactDivisionIds) {
+  const linked = divisions.filter((d) => contactDivisionIds.has(text(d.id)));
+  return (
+    linked.length > 0 &&
+    linked.every((d) => text(d.properties?.buyer_division_uuid).trim() !== '' && isBlockedBuyer(d.properties?.buyer_division_uuid))
+  );
+}
+
+// One entry per unique buyer. Totals are only added within a single currency;
+// if a buyer's Divisions span currencies the amount is left blank rather than
+// adding unlike currencies together.
+function rollUpByBuyer(companyDivisions, contactDivisionIds, locale, t) {
+  const buyers = new Map();
+
+  for (const division of companyDivisions) {
+    if (!isEligible(division)) continue;
+    const p = division.properties;
+    const uuid = text(p.buyer_division_uuid).trim().toLowerCase();
+
+    if (!buyers.has(uuid)) {
+      buyers.set(uuid, {
+        uuid,
+        name: text(p.buyer_division_name).trim() || t.unnamed,
+        associated: false,
+        own: [],   // eligible Divisions the contact is tied to
+        other: []  // eligible Divisions the contact is NOT tied to
+      });
+    }
+    const buyer = buyers.get(uuid);
+    if (contactDivisionIds.has(text(division.id))) {
+      buyer.associated = true;
+      buyer.own.push(division);
+    } else {
+      buyer.other.push(division);
+    }
+  }
+
+  for (const buyer of buyers.values()) {
+    const counted =
+      MIXED_BUYER_MODE === 'all_company_divisions'
+        ? [...buyer.own, ...buyer.other]
+        : buyer.own;
+
+    let invoices = 0;
+    const byCurrency = new Map();
+    let earliestFunds = '';
+    for (const d of counted) {
+      const p = d.properties;
+      invoices += num(p.eligible_invoice_count);
+      const cur = text(p.currency).trim().toUpperCase() || 'USD';
+      byCurrency.set(cur, (byCurrency.get(cur) || 0) + num(p.eligible_invoice_amount));
+      const funds = text(p.market_good_funds_date).trim();
+      if (funds && (!earliestFunds || funds < earliestFunds)) earliestFunds = funds;
+    }
+    buyer.invoices = invoices;
+    buyer.currency = byCurrency.size === 1 ? [...byCurrency.keys()][0] : '';
+    buyer.amount = byCurrency.size === 1 ? [...byCurrency.values()][0] : null;
+    buyer.sortAmount = Math.max(0, ...byCurrency.values());
+    // Ranking amount over ALL of the buyer's eligible Divisions (used to pick the
+    // top buyer when the contact is tied to none of them).
+    const allByCur = new Map();
+    for (const d of [...buyer.own, ...buyer.other]) {
+      const cur = text(d.properties.currency).trim().toUpperCase() || 'USD';
+      allByCur.set(cur, (allByCur.get(cur) || 0) + num(d.properties.eligible_invoice_amount));
+    }
+    buyer.rankAmount = Math.max(0, ...allByCur.values());
+    buyer.fundsDate = formatDate(earliestFunds, locale);
+  }
+
+  return [...buyers.values()];
+}
+
+// ----- HTML blocks ---------------------------------------------------------------
+// Rules applied (bulletproof email tables): numbers/dates never break
+// (nowrap + word-break:normal), buyer names wrap normally, no fixed column
+// widths on money, table sized to a 560px usable width (600px email minus
+// 20px padding each side). CONFIRM that padding against the real template.
+
+const FONT = 'font-family:Arial,Helvetica,sans-serif;';
+const NUM_CELL =
+  'padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:right;white-space:nowrap;word-break:normal;overflow-wrap:normal;';
+const TEXT_CELL =
+  'padding:8px 10px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;';
+const HEAD_NUM =
+  'padding:8px 10px;background:#f3f4f6;font-weight:bold;text-align:right;white-space:nowrap;word-break:normal;overflow-wrap:normal;';
+const HEAD_TEXT =
+  'padding:8px 10px;background:#f3f4f6;font-weight:bold;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;';
+
+function buildAssociatedTable(rows, locale, t) {
+  if (!rows.length) return '';
+  const sorted = [...rows].sort((a, b) => b.sortAmount - a.sortAmount);
+  const cap = sorted.length === MAX_ASSOCIATED_ROWS + 1 ? sorted.length : MAX_ASSOCIATED_ROWS;
+  const shown = sorted.slice(0, cap);
+  const hidden = sorted.length - shown.length;
+
+  const body = shown
+    .map((b) => {
+      // A buyer whose Divisions use different currencies can't be added into one
+      // number, so say so (the label may wrap onto two lines, unlike amounts).
+      const amountCell = b.amount == null
+        ? `<td style="${NUM_CELL.replace('white-space:nowrap;', 'white-space:normal;')}">${escapeHtml(t.multiCurrency)}</td>`
+        : `<td style="${NUM_CELL}">${escapeHtml(formatMoney(b.amount, b.currency, locale))}</td>`;
+      return `  <tr>
+    <td style="${TEXT_CELL}">${escapeHtml(b.name)}</td>
+    <td style="${NUM_CELL}">${escapeHtml(new Intl.NumberFormat(INTL_LOCALE[locale] || 'en-US').format(b.invoices))}</td>
+    ${amountCell}
+  </tr>`;
+    })
+    .join('\n');
+
+  const more = hidden > 0
+    ? `  <tr><td colspan="3" style="padding:8px 10px;${FONT}font-size:13px;color:#6b7280;">${escapeHtml(t.moreCustomers(hidden))}</td></tr>`
+    : '';
+
+  return `<div lang="${locale}" style="overflow-x:auto;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:560px;border-collapse:collapse;${FONT}font-size:14px;color:#111827;">
+  <tr>
+    <td style="${HEAD_TEXT}">${escapeHtml(t.colCustomer)}</td>
+    <td style="${HEAD_NUM}">${escapeHtml(t.colInvoices)}</td>
+    <td style="${HEAD_NUM}">${escapeHtml(t.colAmount)}</td>
+  </tr>
+${body}
+${more}
+</table>
+</div>`.trim();
+}
+
+const BOX_OPEN =
+  '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;"><tr><td bgcolor="#eef3ff" style="background-color:#eef3ff;border-left:4px solid #2d50a8;padding:16px 18px;">';
+const BOX_CLOSE = '</td></tr></table>';
+
+// The blue box lives here (not in the email) so that when there is nothing to
+// show, nothing is drawn. One buyer: the name goes in the heading, no list.
+function buildMissingBlock(missing, companyName, locale, t, messageType, linkUrl, unregistered) {
+  if (!missing.length) return '';
+  linkUrl = linkUrl || EXPAND_NETWORK_URL;
+  // English wording (reviewed copy). Other languages keep the original wording below.
+  const box = t.boxA && (messageType === 'nudge' ? t.boxB : t.boxA);
+
+  if (missing.length === 1) {
+    const useUnreg = !!(unregistered && box && box.bodyUnreg);
+    const link = `<a href="${linkUrl}" style="color:#0b5cab;text-decoration:underline;">${escapeHtml(useUnreg ? box.linkUnreg : t.nudgeLinkOne)}</a>`;
+    if (box) {
+      const bodyOne = messageType === 'nudge' ? (unregistered && box.bodyOneNew ? box.bodyOneNew : box.bodyOne) : (useUnreg ? box.bodyUnreg(link) : box.body(link));
+      return `${BOX_OPEN}<div lang="${locale}" style="${FONT}font-size:14px;line-height:1.5;color:#111827;max-width:560px;">
+<p style="margin:0 0 10px 0;"><strong>${escapeHtml(box.headOne(missing[0].name))}</strong></p>
+<p style="margin:0;">${bodyOne}</p>
+</div>${BOX_CLOSE}`;
+    }
+    return `${BOX_OPEN}<div lang="${locale}" style="${FONT}font-size:14px;line-height:1.5;color:#111827;max-width:560px;">
+<p style="margin:0 0 10px 0;"><strong>${escapeHtml(t.nudgeHeadingOne(companyName, missing[0].name))}</strong></p>
+<p style="margin:0;">${t.nudgeBody(link)}</p>
+</div>${BOX_CLOSE}`;
+  }
+
+  const names = [...missing]
+    .sort((a, b) => a.name.localeCompare(b.name, INTL_LOCALE[locale] || 'en-US'))
+    .map((b) => b.name);
+  // Never hide just one name behind "and 1 more"; show it instead.
+  const cap = names.length === MAX_MISSING_NAMES + 1 ? names.length : MAX_MISSING_NAMES;
+  const shown = names.slice(0, cap);
+  const hidden = names.length - shown.length;
+  // Name "chips": one small outlined tag per buyer. In Outlook desktop the rounded
+  // corners are ignored (they show as rectangles); everything else holds up.
+  const CHIP = `display:inline-block;background:#ffffff;border:1px solid #c7d2ec;border-radius:14px;padding:4px 12px;margin:0 6px 8px 0;${FONT}font-size:13px;line-height:1.5;color:#111827;`;
+  const items = shown
+    .map((n) => `<span style="${CHIP}">${escapeHtml(n)}</span>`)
+    .join('\n');
+  const more = hidden > 0
+    ? `\n<span style="display:inline-block;padding:4px 6px;${FONT}font-size:13px;line-height:1.5;color:#6b7280;">${escapeHtml(t.andMore(hidden))}</span>`
+    : '';
+  const useUnreg = !!(unregistered && box && box.bodyUnreg);
+  const link = `<a href="${linkUrl}" style="color:#0b5cab;text-decoration:underline;">${escapeHtml(useUnreg ? box.linkUnreg : t.nudgeLink)}</a>`;
+
+  const headHtml = box ? escapeHtml(box.head) : escapeHtml(t.nudgeHeading(companyName));
+  const bodyHtml = box ? (messageType === 'nudge' ? (unregistered && box.bodyNew ? box.bodyNew : box.body) : (useUnreg ? box.bodyUnreg(link) : box.body(link))) : t.nudgeBody(link);
+  return `${BOX_OPEN}<div lang="${locale}" style="${FONT}font-size:14px;line-height:1.5;color:#111827;max-width:560px;">
+<p style="margin:0 0 10px 0;"><strong>${headHtml}</strong></p>
+<p style="margin:0 0 10px 0;">${bodyHtml}</p>
+<div style="margin:0;padding:0;">${items}${more}</div>
+</div>${BOX_CLOSE}`;
+}
+
+// The email button link, built here so the email doesn't have to decide:
+// registered contacts go to the app login for the top buyer, everyone else to
+// the top buyer's microsite. Both end in "?partner=..." so the email can append
+// "&lang=...&utm_link=...&utm_series=EAP".
+// Registered contacts: Email B (nudge) goes to Expand Your Network, Email A goes to the app login
+// for the top buyer. Non-registered contacts: always the top buyer's microsite.
+function buildButtonUrl(permalink, registrationStatus, messageType) {
+  if (text(registrationStatus).trim() !== '2') {
+    return `https://${permalink}.c2fo.com/?partner=${permalink}`;
+  }
+  return messageType === 'nudge'
+    ? EXPAND_NETWORK_URL
+    : `https://app.c2fo.com/login?partner=${permalink}`;
+}
+
+function emptyOutput(reason) {
+  console.log(`No EAP content: ${reason}`);
+  return {
+    message_type: 'none',
+    company_name: '',
+    associated_buyer_count: '0',
+    missing_buyer_count: '0',
+    associated_invoice_count: '0',
+    associated_buyers_table: '',
+    missing_buyers_block: '',
+    missing_buyers_text: '',
+    expand_network_url: EXPAND_NETWORK_URL,
+    top_buyer_permalink: 'registration',
+    top_buyer_name: '',
+    top_buyer_microsite_url: 'https://registration.c2fo.com/',
+    button_url: 'https://registration.c2fo.com/?partner=registration',
+    subject_line: '', headline_text: '', intro_text: '', closing_text: '',
+    footnote_text: '', button_label: ''
+  };
+}
+
+// ----- Fast path: use the Company's pre-built snapshot (property eap_buyer_rollup) -----
+// Returns pseudo-Division records, or null when the snapshot can't be trusted
+// (then the live path below reads the Divisions directly, exactly as before).
+function divisionsFromSnapshot(rawSnapshot, companyIds, contactDivisionIds) {
+  const raw = text(rawSnapshot).trim();
+  if (!raw) return null;
+  let snap;
+  try { snap = JSON.parse(raw); } catch (e) { return null; }
+  if (!snap || snap.v !== 1 || !Array.isArray(snap.d) || !Array.isArray(snap.a)) return null;
+
+  const builtAt = Date.parse(snap.t);
+  if (!Number.isFinite(builtAt) || Date.now() - builtAt > MAX_ROLLUP_AGE_HOURS * 3600 * 1000) return null;
+
+  // The contact must belong to exactly this one company, and every Division the
+  // contact is tied to must be one this snapshot knows about.
+  if (companyIds.length !== 1 || text(snap.i) !== text(companyIds[0])) return null;
+  const known = new Set(snap.a.map(text));
+  for (const id of contactDivisionIds) if (!known.has(id)) return null;
+
+  return {
+    companyName: text(snap.c).trim(),
+    divisions: snap.d.map((r) => ({
+      id: text(r[0]),
+      properties: {
+        buyer_division_uuid: r[1],
+        buyer_division_name: (snap.n || {})[r[1]] || '',
+        eligible_invoice_amount: r[2],
+        eligible_invoice_count: r[3],
+        currency: r[4],
+        market_good_funds_date: r[5],
+        market_is_enabled: 'true'
+      }
+    }))
+  };
+}
+
+// Picks the highest-AP buyer among the buyers that appear in this email and
+// returns its microsite permalink. Alert/both emails rank the buyers in the
+// table (associated); nudge emails rank the buyers listed (missing). Amounts in
+// different currencies are not converted: each buyer is ranked by its largest
+// single-currency total. Buyers without a known permalink are skipped.
+function pickTopBuyer(associated, missing) {
+  const pool = associated.length
+    ? associated.map((b) => ({ b, amt: b.sortAmount }))
+    : missing.map((b) => ({ b, amt: b.rankAmount }));
+  let best = null;
+  for (const { b, amt } of pool) {
+    const permalink = BUYER_PERMALINKS[b.uuid];
+    if (!permalink) continue;
+    if (!best || amt > best.amt) best = { permalink, name: b.name, amt };
+  }
+  return best;
+}
+
+// ----- Main ------------------------------------------------------------------------
+
+exports.main = async (event) => {
+  apiCalls = 0; // reset in case the runtime reuses this process between contacts
+  let path = 'live';
+  rateInfo = {};
+  const startedAt = Date.now();
+  // Dedicated service key for the EAP email so its API usage never competes with
+  // AO V3 / Invoice Alerts. Intentionally NO fallback to the shared token.
+  const token = process.env.EAP_SERVICE_KEY_TOKEN;
+  if (!token) {
+    throw new Error('Missing secret EAP_SERVICE_KEY_TOKEN (add it to this custom code action)');
+  }
+  const client = new hubspot.Client({ accessToken: token });
+
+  const contactId = text(event.inputFields.contact_id).trim();
+  const locale = resolveLocale(event.inputFields.contact_email_language);
+  const t = LOCALES[locale];
+  if (!contactId) return { outputFields: emptyOutput('no contact id') };
+
+  // 1. The contact's Companies and Divisions
+  const [companyIds, contactDivisionIdList, suppressed] = await Promise.all([
+    associatedIds(client, 'contacts', contactId, 'companies'),
+    associatedIds(client, 'contacts', contactId, DIVISION_TYPE, CONTACT_TO_DIVISION_ASSOC),
+    loadSuppressedBuyers()
+  ]);
+  SUPPRESSED_BUYERS = suppressed;
+  const contactDivisionIds = new Set(contactDivisionIdList);
+
+  if (!companyIds.length && !contactDivisionIds.size) {
+    return { outputFields: emptyOutput('contact has no company or division') };
+  }
+
+  // 2. Every Division on those Companies. Fast path: when the contact has exactly
+  //    one Company, read that Company's pre-built snapshot (property
+  //    eap_buyer_rollup) in a single call. Otherwise, or if the snapshot is
+  //    missing/stale/doesn't match, read the Divisions live.
+  let divisions;
+  let companyNames = [];
+  let fast = null;
+  let singleCompany = null;
+  if (!FORCE_LIVE_ROLLUP && companyIds.length === 1) {
+    singleCompany = await withRetry(
+      () => client.crm.companies.basicApi.getById(companyIds[0], ['name', 'eap_buyer_rollup']),
+      `Company ${companyIds[0]} read`
+    );
+    fast = divisionsFromSnapshot(
+      singleCompany.properties?.eap_buyer_rollup, companyIds, contactDivisionIds
+    );
+  }
+  if (fast) {
+    divisions = fast.divisions;
+    companyNames = [fast.companyName || text(singleCompany.properties?.name).trim()];
+    path = 'snapshot';
+  } else {
+    const divisionIds = new Set(contactDivisionIds);
+    for (const companyId of companyIds) {
+      const ids = await associatedIds(
+        client, 'companies', companyId, DIVISION_TYPE,
+        COMPANY_TO_DIVISION_ASSOC, MAX_DIVISIONS_PER_COMPANY
+      );
+      ids.forEach((id) => divisionIds.add(id));
+      if (ids.length) {
+        const company =
+          singleCompany ||
+          (await withRetry(
+            () => client.crm.companies.basicApi.getById(companyId, ['name']),
+            `Company ${companyId} read`
+          ));
+        companyNames.push(text(company.properties?.name).trim());
+      }
+    }
+    divisions = await readDivisions(client, [...divisionIds]);
+  }
+
+  // 2b. Contact's own Divisions all belong to suppressed buyers: send nothing.
+  if (allLinkedDivisionsSuppressed(divisions, contactDivisionIds)) {
+    return { outputFields: emptyOutput('all of the contact\'s Divisions belong to blocked buyers') };
+  }
+
+  // 3. Roll up by unique buyer
+  const buyers = rollUpByBuyer(divisions, contactDivisionIds, locale, t);
+  const associated = buyers.filter((b) => b.associated);
+  const missing = buyers.filter((b) => !b.associated);
+
+  if (!associated.length && !missing.length) {
+    return { outputFields: emptyOutput('no eligible buyers after filters') };
+  }
+
+  const companyName = companyNames.find(Boolean) || t.yourCompany;
+  const messageType =
+    associated.length && missing.length ? 'both'
+    : associated.length ? 'alert'
+    : 'nudge';
+
+  const missingNames = [...missing]
+    .map((b) => b.name)
+    .sort((a, b) => a.localeCompare(b, INTL_LOCALE[locale] || 'en-US'));
+
+  // Localized copy for the email's native modules ("middle path"): the email
+  // inserts these as {{ custom.<name> }}.
+  const nudgeOnly = messageType === 'nudge';
+  const isUnregistered = text(event.inputFields.contact_registration_status).trim() !== '2';
+  const oneMissing = missing.length === 1;
+  const oneAssociated = associated.length === 1;
+  const invoiceTotal = associated.reduce((sum, b) => sum + b.invoices, 0);
+  const hasRealCompanyName = companyName !== t.yourCompany;
+  // Date the amounts were read (send time), Kansas City time, e.g. "November 9, 2026".
+  const asOfDate = new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Chicago' });
+  const copy = nudgeOnly
+    ? {
+        subject_line: oneMissing ? t.nudgeSubjectOne(companyName) : t.nudgeSubject(companyName),
+        headline_text: typeof t.nudgeHeadline === 'function' ? t.nudgeHeadline(companyName) : t.nudgeHeadline,
+        intro_text: '',
+        button_label: (isUnregistered && t.nudgeButtonNew) ? t.nudgeButtonNew : (oneMissing ? t.nudgeButtonOne : t.nudgeButton),
+        footnote_text: oneMissing ? t.nudgeFootnoteOne : t.nudgeFootnote
+      }
+    : {
+        subject_line: typeof t.alertSubject === 'function' ? t.alertSubject(invoiceTotal, hasRealCompanyName ? companyName : '') : t.alertSubject,
+        headline_text: typeof t.alertHeadline === 'function' ? t.alertHeadline(invoiceTotal) : t.alertHeadline,
+        intro_text: oneAssociated ? t.alertIntroOne : t.alertIntro,
+        button_label: t.alertButton,
+        footnote_text: typeof t.alertFootnote === 'function' ? t.alertFootnote(asOfDate) : t.alertFootnote
+      };
+
+  const top = pickTopBuyer(associated, missing);
+  const topPermalink = top ? top.permalink : 'registration';
+
+  console.log(`top_buyer=${top ? top.permalink : 'none(fallback)'} path=${path} api calls=${apiCalls} ms=${Date.now() - startedAt} contact=${contactId} locale=${locale} ratelimit=${JSON.stringify(rateInfo)}`);
+  return {
+    outputFields: {
+      ...copy,
+      closing_text: t.alertClosing
+        ? (nudgeOnly ? ((isUnregistered && t.nudgeClosingNew) ? (oneMissing ? t.nudgeClosingOneNew : t.nudgeClosingNew) : (oneMissing ? t.nudgeClosingOne : t.nudgeClosing)) : t.alertClosing)
+        : t.closing,
+      message_type: messageType,
+      company_name: companyName,
+      associated_buyer_count: String(associated.length),
+      missing_buyer_count: String(missing.length),
+      associated_invoice_count: String(associated.reduce((s, b) => s + b.invoices, 0)),
+      associated_buyers_table: buildAssociatedTable(associated, locale, t),
+      // Registered contacts: "add missing customers" goes to Expand Your Network in the app.
+      // Non-registered contacts: the public "Find your buyer" page.
+      missing_buyers_block: buildMissingBlock(missing, companyName, locale, t, messageType,
+        text(event.inputFields.contact_registration_status).trim() === '2'
+          ? EXPAND_NETWORK_URL
+          : FIND_YOUR_BUYER_URL,
+        text(event.inputFields.contact_registration_status).trim() !== '2'),
+      missing_buyers_text: missingNames.slice(0, MAX_MISSING_NAMES).join(', '),
+      expand_network_url: EXPAND_NETWORK_URL,
+      top_buyer_permalink: topPermalink,
+      top_buyer_name: top ? top.name : '',
+      top_buyer_microsite_url: `https://${topPermalink}.c2fo.com/?partner=${topPermalink}`,
+      button_url: buildButtonUrl(topPermalink, event.inputFields.contact_registration_status, messageType)
+    }
+  };
+};
