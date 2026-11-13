@@ -111,6 +111,35 @@
 //                                the single-offer email for whichever CQ won
 //                                the priority + recency tie-break.
 //   "none"                    -> no qualifying CQ at all.
+//
+// ----------------------------------------------------------------------------
+// NODE 24 + SPEED CHANGES (vs. the Node 20 version)
+// ----------------------------------------------------------------------------
+//   * Node 24 format: exports.main no longer takes a `callback`. It RETURNS
+//     { outputFields: {...} } instead. Business rules are unchanged.
+//   * HubSpot search calls per contact: was 3 or more (one "already sent"
+//     search, one "live offers" search, then one campaign search PER offer).
+//     Now exactly 2, no matter how many offers the contact has:
+//       1. ONE Campaign Qualification search that returns both the live
+//          offers and the already-sent offers (two filter groups, OR'd).
+//       2. ONE Campaign search for every campaign those offers belong to.
+//     The offer -> campaign links are read with ONE batch association call
+//     instead of one call per offer.
+//   * Campaign lookups are now almost free. There are only a few dozen
+//     Campaign records, so the code loads ALL of them with one search and
+//     remembers them for CAMPAIGN_CACHE_TTL_MS (5 minutes) while the
+//     container is warm. Each offer carries its campaign's ID
+//     (source_campaign_id), so the campaign is found in memory with no HubSpot
+//     call at all. In steady state a contact now costs ONE HubSpot search.
+//     If an offer has no campaign ID, or its campaign is not in memory (for
+//     example a brand-new campaign), the code falls back to the original
+//     association lookup, so nothing is silently skipped.
+//     Tradeoff: a campaign edited in HubSpot can take up to 5 minutes to be
+//     picked up. Set CAMPAIGN_CACHE_TTL_MS to 0 to always reload.
+//   * Excluded-buyer offers are dropped BEFORE any campaign lookups.
+//   * Buyer logos are cached for the life of the running container.
+//   * Retries are more patient (5 tries, exponential backoff, honours
+//     Retry-After) so a brief HubSpot 429 does not fail the whole action.
 // ============================================================================
  
 const hubspot = require('@hubspot/api-client');
@@ -142,6 +171,9 @@ const NORMALIZED_PRIORITY_CAMPAIGN_NAME = PRIORITY_CAMPAIGN_NAME.trim().toLowerC
 const FALLBACK_LOGO_URL =
   'https://50463701.fs1.hubspotusercontent-na1.net/hubfs/50463701/C2FO%20Logos/c2fo_2_color_logo_500.png'; // Generic logo used when we can't find the buyer's real logo
 const PAYLOAD_PROPERTY = 'payload_json';
+
+// Buyer logos barely change, so remember lookups while this container stays warm.
+const logoCache = new Map();
  
 // AO suppression: read the CQ's consumed checkbox and stable source qualification key.
 const AO_SENT_PROPERTY = 'ao_email_sent';
@@ -240,8 +272,10 @@ const EXCLUDED_BUYERS = new Set([
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  
 const retryable = (error) => {
+  // The Node 24 HubSpot client puts the HTTP status in error.code (a number,
+  // e.g. 429). Older clients use statusCode / status / response.statusCode.
   const status = Number(
-    error?.response?.statusCode ?? error?.statusCode ?? error?.status
+    error?.response?.statusCode ?? error?.statusCode ?? error?.status ?? error?.code
   );
  
   return (
@@ -252,21 +286,39 @@ const retryable = (error) => {
 };
  
 async function withRetry(operation, label) {
+  const maxAttempts = 6;
+
   for (let attempt = 0; ; attempt += 1) {
     try {
       return await operation();
     } catch (error) {
-      if (!retryable(error) || attempt >= 2) {
+      if (!retryable(error) || attempt >= maxAttempts - 1) {
         throw error;
       }
- 
-      const wait = 250 * (attempt + 1);
+
+      // Honour Retry-After when HubSpot sends it (capped so one call can never
+      // eat the whole action timeout); otherwise back off exponentially.
+      const headers = error?.response?.headers || error?.headers || {};
+      const retryAfterSeconds = Number(
+        typeof headers.get === 'function' ? headers.get('retry-after') : headers['retry-after']
+      );
+      const base =
+        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? retryAfterSeconds * 1000
+          : 500 * 2 ** attempt;
+      const wait = Math.min(base, 4000) + Math.floor(Math.random() * 800);
       console.log(`${label} transient failure; retrying in ${wait}ms`);
       await sleep(wait);
     }
   }
 }
- 
+
+function chunk(items, size) {
+  const parts = [];
+  for (let i = 0; i < items.length; i += size) parts.push(items.slice(i, i + size));
+  return parts;
+}
+
 // Read every page so prior sent assets are not missed.
 // Stop with an error rather than use a partial population at the safety cap.
 // This helper performs reads only; it never marks a CQ sent.
@@ -450,66 +502,27 @@ function emptyOutput(rawCount) {
 }
  
 // ----------------------------------------------------------------------------
-// FINDING WHICH CAMPAIGN A CQ RECORD BELONGS TO
+// FINDING WHICH CAMPAIGN EACH CQ RECORD BELONGS TO (batched)
 // ----------------------------------------------------------------------------
-async function campaignDetails(client, cqId) {
-  const associations = await withRetry(
-    () =>
-      client.crm.associations.v4.basicApi.getPage(
-        CQ_TYPE,
-        cqId,
-        CAMPAIGN_TYPE,
-        undefined,
-        100
-      ),
-    `CQ ${cqId} association lookup`
-  );
- 
-  const ids = (associations.results || [])
-    .filter(
-      (item) =>
-        !item.associationTypeId ||
-        String(item.associationTypeId) === String(CAMPAIGN_ASSOCIATION_TYPE_ID)
-    )
-    .map((item) => text(item.toObjectId))
-    .filter(Boolean);
- 
-  if (!ids.length) {
-    return {
-      priority: Number.NEGATIVE_INFINITY,
-      userStatus: 'null',
-      campaignId: '',
-      campaignIds: [],
-      campaignName: '',
-      normalizedCampaignName: '',
-      isTopPriorityCampaign: false,
-      isPriorityCampaign: false,
-      isReducedRateCampaign: false,
-      draftOfferAssets: []
-    };
-  }
- 
-  const response = await withRetry(
-    () =>
-      client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, {
-        filterGroups: [
-          {
-            filters: [
-              {
-                propertyName: 'hs_object_id',
-                operator: 'IN',
-                values: ids
-              }
-            ]
-          }
-        ],
-        properties: ['campaign_name', 'campaign_priority', 'campaign_config'],
-        limit: 100
-      }),
-    `Campaign lookup for CQ ${cqId}`
-  );
- 
-  const campaigns = response.results || [];
+function emptyCampaignDetails(campaignIds) {
+  return {
+    priority: Number.NEGATIVE_INFINITY,
+    userStatus: 'null',
+    campaignId: '',
+    campaignIds,
+    campaignName: '',
+    normalizedCampaignName: '',
+    isTopPriorityCampaign: false,
+    isPriorityCampaign: false,
+    isReducedRateCampaign: false,
+    draftOfferAssets: []
+  };
+}
+
+// Same rules as before, applied to campaign records that are already loaded.
+function pickCampaignDetails(ids, campaignsById) {
+  const campaigns = ids.map((id) => campaignsById.get(id)).filter(Boolean);
+
   const topPriorityCampaign = campaigns.find(
     (campaign) =>
       text(campaign.properties?.campaign_name).trim().toLowerCase() ===
@@ -536,24 +549,13 @@ async function campaignDetails(client, cqId) {
           number(b.properties?.campaign_priority) -
           number(a.properties?.campaign_priority)
       )[0];
- 
+
   if (!campaign) {
-    return {
-      priority: Number.NEGATIVE_INFINITY,
-      userStatus: 'null',
-      campaignId: '',
-      campaignIds: ids,
-      campaignName: '',
-      normalizedCampaignName: '',
-      isTopPriorityCampaign: false,
-      isPriorityCampaign: false,
-      isReducedRateCampaign: false,
-      draftOfferAssets: []
-    };
+    return emptyCampaignDetails(ids);
   }
- 
+
   let config = {};
- 
+
   try {
     config = campaign.properties?.campaign_config
       ? JSON.parse(campaign.properties.campaign_config)
@@ -563,13 +565,13 @@ async function campaignDetails(client, cqId) {
       `AO Campaign ${campaign.id} campaign_config is not valid JSON`
     );
   }
- 
+
   const campaignName = text(campaign.properties?.campaign_name).trim();
   const normalizedCampaignName = campaignName.toLowerCase();
   const draftOfferAssets = Array.isArray(config.draftOfferAssets)
     ? config.draftOfferAssets
     : [];
- 
+
   return {
     campaignId: text(campaign.id),
     campaignIds: ids,
@@ -584,7 +586,183 @@ async function campaignDetails(client, cqId) {
     draftOfferAssets
   };
 }
- 
+
+// ----------------------------------------------------------------------------
+// CAMPAIGN CACHE (all campaigns, remembered briefly)
+// ----------------------------------------------------------------------------
+const CAMPAIGN_CACHE_TTL_MS = 5 * 60 * 1000; // 0 = reload on every run
+const CAMPAIGN_PROPERTIES = [
+  'campaign_name',
+  'campaign_priority',
+  'campaign_config',
+  'campaign_uuid'
+];
+const campaignCache = { loadedAt: 0, byId: new Map(), byUuid: new Map() };
+
+async function refreshCampaignCache(client) {
+  const byId = new Map();
+  const byUuid = new Map();
+  const seenCursors = new Set();
+  let after;
+
+  for (let page = 0; page < 50; page += 1) {
+    const request = { properties: CAMPAIGN_PROPERTIES, limit: 100 };
+    if (after != null) request.after = after;
+
+    const response = await withRetry(
+      () => client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, request),
+      'Campaign cache load'
+    );
+
+    for (const campaign of response.results || []) {
+      byId.set(text(campaign.id), campaign);
+      const uuid = text(campaign.properties?.campaign_uuid).trim().toLowerCase();
+      if (uuid) byUuid.set(uuid, campaign);
+    }
+
+    const next = response.paging?.next?.after;
+    if (next == null) {
+      // One log line per load. Count these across a test batch: few lines means
+      // the cache is being shared between contacts; about one per contact means
+      // each contact runs in a fresh process and nothing is shared.
+      const previousAgeSeconds = campaignCache.loadedAt
+        ? Math.round((Date.now() - campaignCache.loadedAt) / 1000)
+        : null;
+      console.log(
+        `Campaign cache loaded: ${byId.size} campaigns (${
+          previousAgeSeconds == null
+            ? 'cold start'
+            : `replacing a copy ${previousAgeSeconds}s old`
+        })`
+      );
+
+      campaignCache.byId = byId;
+      campaignCache.byUuid = byUuid;
+      campaignCache.loadedAt = Date.now();
+      return;
+    }
+
+    const cursor = String(next);
+    if (seenCursors.has(cursor)) {
+      throw new Error('Campaign cache load returned a repeated pagination cursor');
+    }
+    seenCursors.add(cursor);
+    after = next;
+  }
+
+  throw new Error('Campaign cache load exceeded its page safety limit');
+}
+
+async function getCampaignCache(client) {
+  const age = Date.now() - campaignCache.loadedAt;
+  if (CAMPAIGN_CACHE_TTL_MS <= 0 || age >= CAMPAIGN_CACHE_TTL_MS || !campaignCache.byId.size) {
+    await refreshCampaignCache(client);
+  }
+  return campaignCache;
+}
+
+// Finds each offer's campaign details. Fast path: the offer's own campaign ID
+// matched against the cached campaigns (no HubSpot call). Anything that cannot
+// be matched that way goes through the original association lookup.
+async function resolveCampaignDetails(client, items) {
+  const details = new Map();
+  let cache = null;
+
+  try {
+    cache = await getCampaignCache(client);
+  } catch (error) {
+    console.log(`Campaign cache unavailable; using association lookup: ${error.message || error}`);
+  }
+
+  const unresolved = [];
+
+  for (const item of items) {
+    const campaign =
+      cache && item.sourceCampaignUuid ? cache.byUuid.get(item.sourceCampaignUuid) : undefined;
+
+    if (campaign) {
+      details.set(item.cqId, pickCampaignDetails([text(campaign.id)], cache.byId));
+    } else {
+      unresolved.push(item.cqId);
+    }
+  }
+
+  if (unresolved.length) {
+    const fallback = await loadCampaignDetails(client, unresolved);
+    for (const [cqId, value] of fallback) details.set(cqId, value);
+  }
+
+  return details;
+}
+
+// Loads the campaign details for ALL of a contact's CQs with:
+//   - one batch association read (CQ -> Campaign links), and
+//   - one Campaign search (all campaigns at once).
+// Returns Map<cqId, details>.
+async function loadCampaignDetails(client, cqIds) {
+  const idsByCq = new Map(cqIds.map((id) => [id, []]));
+
+  for (const part of chunk(cqIds, 100)) {
+    const response = await withRetry(
+      () =>
+        client.crm.associations.v4.batchApi.getPage(CQ_TYPE, CAMPAIGN_TYPE, {
+          inputs: part.map((id) => ({ id }))
+        }),
+      'CQ association batch lookup'
+    );
+
+    for (const row of response.results || []) {
+      // The SDK exposes the JSON key "from" as "_from".
+      const cqId = text(row._from?.id ?? row.from?.id);
+      const linked = (row.to || [])
+        .filter((item) => {
+          const types = Array.isArray(item.associationTypes) ? item.associationTypes : [];
+          return (
+            !types.length ||
+            types.some((type) => String(type.typeId) === String(CAMPAIGN_ASSOCIATION_TYPE_ID))
+          );
+        })
+        .map((item) => text(item.toObjectId))
+        .filter(Boolean);
+
+      if (cqId && idsByCq.has(cqId)) idsByCq.set(cqId, linked);
+    }
+  }
+
+  const campaignsById = new Map();
+  const allCampaignIds = [...new Set([...idsByCq.values()].flat())];
+
+  for (const part of chunk(allCampaignIds, 100)) {
+    const response = await withRetry(
+      () =>
+        client.crm.objects.searchApi.doSearch(CAMPAIGN_TYPE, {
+          filterGroups: [
+            {
+              filters: [
+                {
+                  propertyName: 'hs_object_id',
+                  operator: 'IN',
+                  values: part
+                }
+              ]
+            }
+          ],
+          properties: ['campaign_name', 'campaign_priority', 'campaign_config'],
+          limit: 100
+        }),
+      'Campaign lookup'
+    );
+
+    for (const campaign of response.results || []) {
+      campaignsById.set(text(campaign.id), campaign);
+    }
+  }
+
+  return new Map(
+    cqIds.map((cqId) => [cqId, pickCampaignDetails(idsByCq.get(cqId) || [], campaignsById)])
+  );
+}
+
 // ----------------------------------------------------------------------------
 // TIE-BREAKER: choosing the "best" CQ between two candidates
 //   1. Whichever is tied to the higher-priority campaign wins.
@@ -863,10 +1041,13 @@ ${buttonRow}
 // ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
-exports.main = async (event, callback) => {
-  const client = new hubspot.Client({
-    accessToken: process.env.PRIVATE_APP_ACCESS_TOKEN
-  });
+exports.main = async (event) => {
+  // Dedicated key for this workflow (secret name must match exactly, including case).
+  const accessToken = process.env.AO_Workflow_Key;
+  if (!accessToken) {
+    throw new Error('Secret AO_Workflow_Key is not available to this action. Add it under "Secrets" in the custom code action.');
+  }
+  const client = new hubspot.Client({ accessToken });
  
   // ---- STEP 1: Get the contact's unique ID and preferred language ----
   const auth = text(event.inputFields.contact_auth_uuid);
@@ -875,25 +1056,44 @@ exports.main = async (event, callback) => {
   const contactLanguage = event.inputFields.contact_email_language;
  
   if (!auth) {
-    return callback({ outputFields: emptyOutput(0) });
+    return { outputFields: emptyOutput(0) };
   }
  
-  // AO suppression history: include expired CQs for this same recipient.
-  // The separate post-send action sets ao_email_sent after Send email is exited.
-  const sentResponse = await searchAllCqs(client, {
+  // ---- STEP 2: ONE search for this recipient's Campaign Qualification records.
+  //   Filter group 1: live, unexpired offers.
+  //   Filter group 2: offers already marked sent (may be expired) — the
+  //                   AO suppression history. The separate post-send action
+  //                   sets ao_email_sent after Send email is exited.
+  // A record that matches both groups is returned once. ----
+  const now = Date.now();
+  const recipientFilters = [
+    {
+      propertyName: 'recipient_auth_service_uuid',
+      operator: 'EQ',
+      value: auth
+    },
+    {
+      propertyName: 'payload_kind',
+      operator: 'EQ',
+      value: 'ACTIONABLE_OFFER'
+    }
+  ];
+
+  const response = await searchAllCqs(client, {
     filterGroups: [
       {
         filters: [
+          ...recipientFilters,
           {
-            propertyName: 'recipient_auth_service_uuid',
-            operator: 'EQ',
-            value: auth
-          },
-          {
-            propertyName: 'payload_kind',
-            operator: 'EQ',
-            value: 'ACTIONABLE_OFFER'
-          },
+            propertyName: 'expires_at',
+            operator: 'GT',
+            value: String(now)
+          }
+        ]
+      },
+      {
+        filters: [
+          ...recipientFilters,
           {
             propertyName: AO_SENT_PROPERTY,
             operator: 'EQ',
@@ -902,55 +1102,31 @@ exports.main = async (event, callback) => {
         ]
       }
     ],
-    properties: [SOURCE_QUALIFICATION_PROPERTY],
-    limit: 100
+    properties: [
+      'payload_json',
+      'source_run_started_at',
+      'expires_at',
+      SOURCE_QUALIFICATION_PROPERTY,
+      AO_SENT_PROPERTY,
+      'source_campaign_id'
+    ],
+    limit: 200
   });
- 
+
+  const allRecords = response.results || [];
+
   const sentSourceQualificationIds = new Set(
-    sentResponse.results
+    allRecords
+      .filter((record) => aoCheckboxIsTrue(record.properties?.[AO_SENT_PROPERTY]))
       .map((record) => text(record.properties?.[SOURCE_QUALIFICATION_PROPERTY]).trim())
       .filter(Boolean)
   );
- 
-  // ---- STEP 2: Search for this contact's live, unexpired offer records ----
-  const response = await withRetry(
-    () =>
-      searchAllCqs(client, {
-        filterGroups: [
-          {
-            filters: [
-              {
-                propertyName: 'recipient_auth_service_uuid',
-                operator: 'EQ',
-                value: auth
-              },
-              {
-                propertyName: 'payload_kind',
-                operator: 'EQ',
-                value: 'ACTIONABLE_OFFER'
-              },
-              {
-                propertyName: 'expires_at',
-                operator: 'GT',
-                value: String(Date.now())
-              }
-            ]
-          }
-        ],
-        properties: [
-          'payload_json',
-          'source_run_started_at',
-          'expires_at',
-          SOURCE_QUALIFICATION_PROPERTY,
-          AO_SENT_PROPERTY
-        ],
-        limit: 100
-      }),
-    'Campaign Qualification search'
+
+  // Live (unexpired) records only — the same population the old live search returned.
+  const records = allRecords.filter(
+    (record) => timestamp(record.properties?.expires_at) > now
   );
- 
-  const records = response.results || [];
- 
+
   // Remove already-consumed CQs/assets before campaign lookups and ranking.
   // Blank asset IDs remain eligible to preserve original selection behavior.
   // They are blocked at the final handoff below rather than silently consumed.
@@ -958,52 +1134,58 @@ exports.main = async (event, callback) => {
     if (aoCheckboxIsTrue(record.properties?.[AO_SENT_PROPERTY])) {
       return false;
     }
- 
+
     const sourceQualificationId = text(
       record.properties?.[SOURCE_QUALIFICATION_PROPERTY]
     ).trim();
- 
+
     return !sourceQualificationId || !sentSourceQualificationIds.has(sourceQualificationId);
   });
- 
-  // ---- STEP 3: Load each CQ's campaign details, then remove any records
-  //              tied to excluded buyers. ----
-  const candidates = await Promise.all(
-    unsentRecords.map(async (record) => {
-      const payload = parsePayload(record);
-      const buyerName = text(payload?.primary_buyer_name).trim();
-      const buyerPermalink = text(payload?.primary_buyer_permalink).trim().toLowerCase();
-      const offerType = normalizeOfferType(payload?.offer_type);
-      const details = await campaignDetails(client, record.id);
- 
-      return {
-        ...details,
-        id: text(record.id),
-        sourceQualificationId: text(record.properties?.[SOURCE_QUALIFICATION_PROPERTY]).trim(),
-        raw: text(record.properties?.[PAYLOAD_PROPERTY]),
-        payload,
-        buyerName,
-        buyerPermalink,
-        offerType,
-        kind: offerKind(offerType),
-        isRetailEligibleBuyer: RETAIL_ELIGIBLE_BUYERS.has(
-          normalizeBuyer(buyerName)
-        ),
-        started: text(record.properties?.source_run_started_at)
-      };
-    })
+
+  // ---- STEP 3: Read each offer's payload and drop excluded buyers FIRST, so
+  //              no campaign lookups are spent on offers that cannot win. ----
+  const parsed = unsentRecords.map((record) => {
+    const payload = parsePayload(record);
+    const buyerName = text(payload?.primary_buyer_name).trim();
+    const buyerPermalink = text(payload?.primary_buyer_permalink).trim().toLowerCase();
+    const offerType = normalizeOfferType(payload?.offer_type);
+
+    return { record, payload, buyerName, buyerPermalink, offerType };
+  });
+
+  const survivors = parsed.filter(
+    (item) =>
+      item.payload &&
+      !EXCLUDED_BUYERS.has(normalizeBuyer(item.payload.primary_buyer_name))
   );
- 
-  const eligible = candidates.filter(
-    (candidate) =>
-      candidate.payload &&
-      !EXCLUDED_BUYERS.has(normalizeBuyer(candidate.payload.primary_buyer_name))
-  );
- 
-  if (!eligible.length) {
-    return callback({ outputFields: emptyOutput(records.length) });
+
+  if (!survivors.length) {
+    return { outputFields: emptyOutput(records.length) };
   }
- 
+
+  // Campaign details for every surviving offer (usually no HubSpot call; see CAMPAIGN CACHE).
+  const detailsByCq = await resolveCampaignDetails(
+    client,
+    survivors.map((item) => ({
+      cqId: text(item.record.id),
+      sourceCampaignUuid: text(item.record.properties?.source_campaign_id).trim().toLowerCase()
+    }))
+  );
+
+  const eligible = survivors.map(({ record, payload, buyerName, buyerPermalink, offerType }) => ({
+    ...detailsByCq.get(text(record.id)),
+    id: text(record.id),
+    sourceQualificationId: text(record.properties?.[SOURCE_QUALIFICATION_PROPERTY]).trim(),
+    raw: text(record.properties?.[PAYLOAD_PROPERTY]),
+    payload,
+    buyerName,
+    buyerPermalink,
+    offerType,
+    kind: offerKind(offerType),
+    isRetailEligibleBuyer: RETAIL_ELIGIBLE_BUYERS.has(normalizeBuyer(buyerName)),
+    started: text(record.properties?.source_run_started_at)
+  }));
+
   // ---- STEP 4: For each surviving record, we already know its campaign
   //              details (including whether that campaign is configured for
   //              more than one offer type, and whether it's a Reduced Rate
@@ -1129,7 +1311,7 @@ exports.main = async (event, callback) => {
       'Winning Campaign Qualification is missing buyer identity, buyer division UUID, or a valid number of customers'
     );
  
-    return callback({ outputFields: emptyOutput(records.length) });
+    return { outputFields: emptyOutput(records.length) };
   }
  
   const payload = selected.payload;
@@ -1150,31 +1332,38 @@ const standardRateType = text(payload.original_pricing?.rate_type);
  
   // ---- STEP 10: Look up a logo image for this buyer ----
   let logo = FALLBACK_LOGO_URL;
- 
-  try {
-    const logoResponse = await withRetry(
-      () =>
-        client.apiRequest({
-          method: 'GET',
-          path: '/cms/v3/hubdb/tables/buyer_logos/rows',
-          qs: {
-            buyer_key__eq:
-              buyerPermalink.toLowerCase() || buyerName.toLowerCase(),
-            limit: 1
-          }
-        }),
-      'Buyer logo lookup'
-    );
- 
-    const value = (await logoResponse.json()).results?.[0]?.values?.logo_url;
-    logo =
-      typeof value === 'string' && value
-        ? value
-        : value?.url || FALLBACK_LOGO_URL;
-  } catch (error) {
-    console.log(`Buyer logo lookup failed: ${error.message || error}`);
+  const logoKey = buyerPermalink.toLowerCase() || buyerName.toLowerCase();
+
+  if (logoCache.has(logoKey)) {
+    logo = logoCache.get(logoKey);
+  } else {
+    try {
+      const logoResponse = await withRetry(
+        () =>
+          client.apiRequest({
+            method: 'GET',
+            path: '/cms/v3/hubdb/tables/buyer_logos/rows',
+            qs: {
+              buyer_key__eq: logoKey,
+              limit: 1
+            }
+          }),
+        'Buyer logo lookup'
+      );
+
+      const value = (await logoResponse.json()).results?.[0]?.values?.logo_url;
+      logo =
+        typeof value === 'string' && value
+          ? value
+          : value?.url || FALLBACK_LOGO_URL;
+
+      // Only remember real answers; a failed lookup is retried next time.
+      logoCache.set(logoKey, logo);
+    } catch (error) {
+      console.log(`Buyer logo lookup failed: ${error.message || error}`);
+    }
   }
- 
+
   // ---- STEP 11: Build the draft offers table from sameRunGroup — one
   //               column per recognized offer type, in Preferred-then-
   //               One-Time order. ----
@@ -1223,7 +1412,7 @@ const standardRateType = text(payload.original_pricing?.rate_type);
   );
  
   // ---- STEP 12: Hand everything back to the workflow ----
-  callback({
+  return {
     outputFields: {
       matching_cq_count: String(selectionPool.length),
       raw_matching_cq_count: String(records.length),
@@ -1280,7 +1469,5 @@ const standardRateType = text(payload.original_pricing?.rate_type);
       standard_rate: standardRate,
       standard_rate_type: formatRateType(standardRateType, contactLanguage)
     }
-  });
+  };
 };
- 
-
