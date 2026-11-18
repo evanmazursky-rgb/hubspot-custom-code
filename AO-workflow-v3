@@ -21,8 +21,9 @@
 //      (whether the campaign offers a fixed, pre-set discounted rate rather
 //      than a market-based one — this is what makes it a Reduced Rate
 //      campaign).
-//   4. Pick the winning CQ in this order: any CQ from a Reduced Rate
-//      campaign always wins first, ahead of everything else. Otherwise, any
+//   4. Pick the winning CQ in this order: any CQ from the SS One-Time >
+//      Recurring AO campaign wins before anything else. Otherwise, any CQ from a Reduced Rate
+//      campaign wins next, ahead of everything below. Otherwise, any
 //      CQ from the Lapse & Attrited campaign wins next. Otherwise, if there
 //      are CQs in the priority Retail campaign AND the buyer is on our
 //      approved retail list, pick the best one of those. Otherwise, pick the
@@ -51,6 +52,17 @@
 // If at any point there's nothing usable to show (no CQs, all excluded,
 // missing required info), it hands back a safe "empty" set of fields instead
 // of guessing.
+//
+// ----------------------------------------------------------------------------
+// SS ONE-TIME > RECURRING AO CAMPAIGN (highest tier of all)
+// ----------------------------------------------------------------------------
+// Any CQ that belongs to the campaign "SS One-Time > Recurring AO" (identified
+// by its campaign UUID, so renaming the campaign cannot break it) wins ahead of
+// EVERYTHING else, including Reduced Rate. All buyers are eligible except the
+// ones on the EXCLUDED_BUYERS list. It always uses the single-offer card (one
+// offer, never the Preferred + One-Time comparison table). cq_match_status is
+// 'ss_one_time_to_recurring', which the workflow uses to route to its own
+// email copy. No new outputs were added; the workflow just branches on that status.
 //
 // ----------------------------------------------------------------------------
 // REDUCED RATE DETECTION
@@ -158,6 +170,10 @@ const CAMPAIGN_ASSOCIATION_TYPE_ID = 353;  // The specific "link type" that conn
 // qualifies, so multiple buyer-specific Reduced Rate campaigns can all feed
 // into this same tier. See REDUCED RATE DETECTION above.
 const REDUCED_RATE_MATCH_STATUS = 'Reduced Rate campaign';
+
+// SS One-Time > Recurring AO: matched by campaign UUID (stable), not by name.
+const SS_CAMPAIGN_UUID = '08206a50-8be5-45df-b5b3-328157a130b8';
+const SS_MATCH_STATUS = 'ss_one_time_to_recurring';
  
 // TOP_PRIORITY_CAMPAIGN_NAME outranks everything except Reduced Rate above.
 // Unlike Retail below, there's no buyer allowlist for this one — any CQ tied
@@ -511,6 +527,7 @@ function emptyCampaignDetails(campaignIds) {
     campaignId: '',
     campaignIds,
     campaignName: '',
+    campaignUuid: '',
     normalizedCampaignName: '',
     isTopPriorityCampaign: false,
     isPriorityCampaign: false,
@@ -576,6 +593,7 @@ function pickCampaignDetails(ids, campaignsById) {
     campaignId: text(campaign.id),
     campaignIds: ids,
     campaignName,
+    campaignUuid: text(campaign.properties?.campaign_uuid).trim().toLowerCase(),
     normalizedCampaignName,
     isTopPriorityCampaign: normalizedCampaignName === NORMALIZED_TOP_PRIORITY_CAMPAIGN_NAME,
     isPriorityCampaign: normalizedCampaignName === NORMALIZED_PRIORITY_CAMPAIGN_NAME,
@@ -747,7 +765,7 @@ async function loadCampaignDetails(client, cqIds) {
               ]
             }
           ],
-          properties: ['campaign_name', 'campaign_priority', 'campaign_config'],
+          properties: ['campaign_name', 'campaign_priority', 'campaign_config', 'campaign_uuid'],
           limit: 100
         }),
       'Campaign lookup'
@@ -1183,7 +1201,15 @@ exports.main = async (event) => {
     offerType,
     kind: offerKind(offerType),
     isRetailEligibleBuyer: RETAIL_ELIGIBLE_BUYERS.has(normalizeBuyer(buyerName)),
-    started: text(record.properties?.source_run_started_at)
+    started: text(record.properties?.source_run_started_at),
+    sourceCampaignUuid: text(record.properties?.source_campaign_id).trim().toLowerCase()
+  })).map((candidate) => ({
+    ...candidate,
+    // The CQ's own campaign ID is checked too, so the SS campaign is still
+    // recognised even if the campaign record itself could not be read.
+    isSsCampaign:
+      candidate.campaignUuid === SS_CAMPAIGN_UUID ||
+      candidate.sourceCampaignUuid === SS_CAMPAIGN_UUID
   }));
 
   // ---- STEP 4: For each surviving record, we already know its campaign
@@ -1194,6 +1220,7 @@ exports.main = async (event) => {
   // ---- STEP 5: Split candidates into four pools, highest priority first.
   //              Reduced Rate is checked (and excluded from every pool
   //              below it) first, since it now outranks everything. ----
+  const ssCandidates = eligible.filter((candidate) => candidate.isSsCampaign);
   const reducedRateCandidates = eligible.filter(
     (candidate) => candidate.isReducedRateCampaign
   );
@@ -1215,7 +1242,9 @@ exports.main = async (event) => {
   );
  
   const selectionPool =
-    reducedRateCandidates.length > 0
+    ssCandidates.length > 0
+      ? ssCandidates
+      : reducedRateCandidates.length > 0
       ? reducedRateCandidates
       : topPriorityCandidates.length > 0
         ? topPriorityCandidates
@@ -1242,7 +1271,7 @@ exports.main = async (event) => {
     const multiOfferConfigured = isMultiOfferCampaign(selected);
  
     sameRunGroup =
-      multiOfferConfigured && selected.started
+      !selected.isSsCampaign && multiOfferConfigured && selected.started
         ? eligible.filter(
             (candidate) =>
               candidate.campaignId &&
@@ -1251,7 +1280,9 @@ exports.main = async (event) => {
           )
         : [selected];
  
-    if (reducedRateCandidates.length > 0) {
+    if (ssCandidates.length > 0) {
+      cqMatchStatus = SS_MATCH_STATUS;
+    } else if (reducedRateCandidates.length > 0) {
       cqMatchStatus = REDUCED_RATE_MATCH_STATUS;
     } else if (topPriorityCandidates.length > 0) {
       cqMatchStatus = TOP_PRIORITY_CAMPAIGN_NAME;
@@ -1269,7 +1300,11 @@ exports.main = async (event) => {
   }
  
   // ---- STEP 8: Log what happened, for visibility in HubSpot's workflow logs ----
-  if (cqMatchStatus === REDUCED_RATE_MATCH_STATUS) {
+  if (cqMatchStatus === SS_MATCH_STATUS) {
+    console.log(
+      `cq_match_status=${SS_MATCH_STATUS}: selected a CQ from the SS One-Time > Recurring AO campaign (${selected.campaignName || SS_CAMPAIGN_UUID}), taking precedence over ${reducedRateCandidates.length} Reduced Rate, ${topPriorityCandidates.length} Lapse & Attrited, ${eligibleRetailCandidates.length} eligible retail and ${nonRetailCandidates.length} other CQ(s).`
+    );
+  } else if (cqMatchStatus === REDUCED_RATE_MATCH_STATUS) {
     console.log(
       `cq_match_status=${REDUCED_RATE_MATCH_STATUS}: selected a CQ from a fixed-rate Reduced Rate campaign (${selected.campaignName || 'unknown'}), taking precedence over ${topPriorityCandidates.length} Lapse & Attrited CQ(s), ${eligibleRetailCandidates.length} eligible retail CQ(s), and ${nonRetailCandidates.length} other non-retail CQ(s).`
     );
